@@ -94,6 +94,7 @@ import { useMultiFileAuthStateRedisDb } from '@utils/use-multi-file-auth-state-r
 import axios from 'axios';
 import makeWASocket, {
   AnyMessageContent,
+  BinaryNode,
   BufferedEventData,
   BufferJSON,
   CacheStore,
@@ -174,13 +175,21 @@ type ChatState = { archived?: boolean; pinned?: boolean; muteEndTime?: number | 
 const CALL_EVENTS = ['CB:call', 'CB:ack,class:call'] as const;
 
 /**
+ * Top-level <status> stanza (contacts' status updates, see #51). Baileys has no handler for it, so it is never acked
+ * and about 50 min later the server closes the stream (`stream:error` naming `ack class=status`) and redelivers it on
+ * reconnect, forever. We ack it ourselves (plain ack, no error code: a NACK keeps it pending server-side).
+ */
+const STATUS_STANZA_EVENT = 'CB:status';
+
+/**
  * Reconnect policy for retryable closes (see #10). Delay before attempt N is RECONNECT_DELAYS_MS[N - 1], and the last
- * value repeats. After MAX_RECONNECT_ATTEMPTS the instance stops (session kept) instead of looping for hours.
+ * value repeats. There is no attempt cap (see #51): a retryable close is retried every 5 min until it succeeds, so an
+ * outage of any length recovers on its own and the row stays 'connecting' (auto-connected at boot). Only logout,
+ * delete and a manual connect stop the loop (stopReconnecting).
  * The attempt counter resets only after the connection has stayed open for STABLE_CONNECTION_MS: in a 440 loop every
- * attempt briefly reaches 'open', so resetting on any open would never run out.
+ * attempt briefly reaches 'open', so resetting on any open would keep the delays at their shortest.
  */
 export const RECONNECT_DELAYS_MS = [1_000, 2_000, 5_000, 15_000, 30_000, 60_000, 120_000, 300_000];
-export const MAX_RECONNECT_ATTEMPTS = 20;
 export const STABLE_CONNECTION_MS = 60_000;
 
 /**
@@ -683,6 +692,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     try {
       CALL_EVENTS.forEach((event) => previous.ws?.removeAllListeners(event));
+      previous.ws?.removeAllListeners(STATUS_STANZA_EVENT);
     } catch {
       // ignore
     }
@@ -862,6 +872,12 @@ export class BaileysStartupService extends ChannelStartupService {
       });
     }
 
+    // Also sees offline stanzas, so statuses redelivered after a 50-min close are acked on the first reconnect.
+    client.ws.on(STATUS_STANZA_EVENT, (node: BinaryNode) => {
+      if (generation !== this.clientGeneration) return;
+      client.sendMessageAck(node).catch((error) => this.logger.warn(`status ack failed: ${error?.message ?? error}`));
+    });
+
     this.phoneNumber = number;
 
     return client;
@@ -942,15 +958,10 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     const attempt = this.reconnectAttempts + 1;
-    if (attempt > MAX_RECONNECT_ATTEMPTS) {
-      this.giveUpReconnecting(statusCode, lastDisconnect).catch((error) => this.logger.error(error));
-      return;
-    }
-
     this.reconnectAttempts = attempt;
     const delayMs = reconnectDelayMs(attempt, statusCode);
     this.logger.warn(
-      `Connection closed (status ${statusCode ?? 'none'}), reconnect attempt ${attempt}/${MAX_RECONNECT_ATTEMPTS} in ${delayMs / 1000}s`,
+      `Connection closed (status ${statusCode ?? 'none'}), reconnect attempt ${attempt} in ${delayMs / 1000}s`,
     );
 
     const generation = this.clientGeneration;
@@ -985,25 +996,6 @@ export class BaileysStartupService extends ChannelStartupService {
     } catch (error) {
       this.logger.error(`Failed to record reconnecting status: ${error?.message ?? error}`);
     }
-
-    this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
-  }
-
-  /**
-   * Retries ran out: stop, but keep the session (no logout.instance, which would wipe it and force a QR scan).
-   * The instance ends `close` with the reason recorded, so monitoring can see it and /instance/connect recovers it.
-   */
-  private async giveUpReconnecting(statusCode: number | undefined, lastDisconnect?: ConnectionState['lastDisconnect']) {
-    this.stopReconnecting();
-    this.teardownClient();
-
-    this.logger.error(
-      `Giving up reconnecting after ${MAX_RECONNECT_ATTEMPTS} attempts (last status ${statusCode ?? 'none'}). ` +
-        'Session kept; call /instance/connect to retry.',
-    );
-
-    this.stateConnection = { state: 'close', statusReason: statusCode };
-    await this.markClosed(statusCode, lastDisconnect);
 
     this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
   }
