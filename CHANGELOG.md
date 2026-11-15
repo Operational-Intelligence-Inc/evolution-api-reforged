@@ -1,3 +1,45 @@
+# 3.0.0 (2026-11-15)
+
+First release of this fork. Images are published to `ghcr.io/operational-intelligence-inc/evolution-api-reforged`.
+
+### ⚠ Breaking changes
+
+* **Global API key required**: the server refuses to start when `AUTHENTICATION_API_KEY` is missing, blank, or one of the published example/fallback values. The Docker image no longer bakes in the example key.
+* **Chatwoot webhook authentication**: `POST /chatwoot/webhook/:instanceName` now requires `?token=HMAC-SHA256(AUTHENTICATION_API_KEY, 'chatwoot-webhook:' + instanceName)`. Existing Chatwoot inboxes must be pointed at the new URL: `GET /chatwoot/find/:instanceName` returns it as `webhook_url`.
+* **Chatbot routes gated by their flags**: chatbot routers (Chatwoot, Typebot, OpenAI, Dify, Flowise, N8N, EvoAI) are mounted only when their `*_ENABLED` flag is on. EvolutionBot stays mounted.
+* **Instance tokens**: instance tokens are accepted only on `GET /instance/fetchInstances` among the non-instance routes; `POST /instance/create` and `POST /verify-creds` require the global key.
+* **WebSocket**: sockets are bound to the instance token used at handshake; global events go to a `global` room.
+* **Typebot**: sessions receive the instance token instead of the global API key (GHSA-p93r-4jh7-fp6r).
+* **Message uniqueness**: a migration removes duplicate `Message` rows and adds a unique index on (instanceId, remoteJid, key id, fromMe).
+
+### Security
+
+* Block SSRF via tenant-supplied media URLs
+* Scope S3 `getMedia` and Chat/Message/Contact lookups to the caller's instance
+* Bind Chatwoot import SQL parameters
+* Only apply inbound message edits from the original author
+* Upgrade Baileys 7.0.0-rc.9 → 7.0.0-rc14 (GHSA-qvv5-jq5g-4cgg)
+* Docker scripts no longer print `DATABASE_URL` (with credentials) to the container log
+
+### Features
+
+* `POST /chat/lidMapping/{instance}`: resolve LIDs ↔ phone numbers from Baileys' mapping
+* Persist archived, pinned, mute and unread state of chats from WhatsApp, aligned with WhatsApp's own unread counts
+
+### Fixed
+
+* **Baileys connection**: ack top-level `<status>` stanzas (stopped the ~50 min stream close); reconnect with backoff (1s → 5m) and never give up; record retryable closes in `connectionStatus`; restart instances through one reconnect path and serialise socket creation
+* **Cache**: stop doubling the domain in IsOnWhatsapp `jidOptions`; exact JID lookups via a GIN index
+* **Messages**: `findMessages` applies `where.message` and one-sided timestamp ranges
+* **Migrations**: skip the message unique-key migration when a valid index already exists
+* **Logging**: all `console.*` output goes through the Logger, so `LOG_LEVEL` controls it
+* **Performance**: `fetchInstances` counts only the selected instances' rows
+
+### Release process
+
+* Merging into `prod` publishes the image to GHCR (`<version>`, `<major>.<minor>`, `latest`, `sha-<short>`), tags `v<version>` and creates a GitHub Release. The run fails if `v<version>` already exists, so bump `package.json` before merging.
+* Removed the upstream workflows that pushed to `evoapicloud/evolution-api` on Docker Hub.
+
 # 2.3.7 (2025-12-05)
 
 ### Features
