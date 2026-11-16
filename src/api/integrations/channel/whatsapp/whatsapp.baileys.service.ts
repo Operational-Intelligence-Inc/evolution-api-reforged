@@ -74,6 +74,7 @@ import {
   Openai,
   ProviderSession,
   QrCode,
+  Reconnect,
   S3,
 } from '@config/env.config';
 import { BadRequestException, InternalServerErrorException, NotFoundException } from '@exceptions';
@@ -157,6 +158,7 @@ import { PassThrough, Readable } from 'stream';
 import { v4 } from 'uuid';
 
 import { BaileysMessageProcessor } from './baileysMessage.processor';
+import { decideOnClose, nextConflictCount, reconnectDelayMs, STABLE_CONNECTION_MS } from './reconnect.policy';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 
 export interface ExtendedIMessageKey extends proto.IMessageKey {
@@ -182,17 +184,6 @@ const CALL_EVENTS = ['CB:call', 'CB:ack,class:call'] as const;
 const STATUS_STANZA_EVENT = 'CB:status';
 
 /**
- * Reconnect policy for retryable closes (see #10). Delay before attempt N is RECONNECT_DELAYS_MS[N - 1], and the last
- * value repeats. There is no attempt cap (see #51): a retryable close is retried every 5 min until it succeeds, so an
- * outage of any length recovers on its own and the row stays 'connecting' (auto-connected at boot). Only logout,
- * delete and a manual connect stop the loop (stopReconnecting).
- * The attempt counter resets only after the connection has stayed open for STABLE_CONNECTION_MS: in a 440 loop every
- * attempt briefly reaches 'open', so resetting on any open would keep the delays at their shortest.
- */
-export const RECONNECT_DELAYS_MS = [1_000, 2_000, 5_000, 15_000, 30_000, 60_000, 120_000, 300_000];
-export const STABLE_CONNECTION_MS = 60_000;
-
-/**
  * Whether an inbound edit comes from the author of the stored message it targets (see #25). The lookup already
  * matched the chat and fromMe, which settles 1:1 chats and our own edits. In groups, the sender (participant, in LID
  * or PN form) must be one of the original's participant forms.
@@ -213,15 +204,6 @@ export function isSameAuthor(originalKey: ExtendedIMessageKey, edit: proto.IWebM
   const senders = forms(editKey.participant, editKey.participantAlt, edit?.participant);
 
   return [...senders].some((jid) => authors.has(jid));
-}
-
-export function reconnectDelayMs(attempt: number, statusCode?: number): number {
-  // 515 (restart required) is the normal restart right after pairing: reconnect at once the first time.
-  if (attempt === 1 && statusCode === DisconnectReason.restartRequired) {
-    return 0;
-  }
-
-  return RECONNECT_DELAYS_MS[Math.min(Math.max(attempt, 1), RECONNECT_DELAYS_MS.length) - 1];
 }
 
 export const LID_MAPPING_MAX_ENTRIES = 200;
@@ -350,6 +332,8 @@ export class BaileysStartupService extends ChannelStartupService {
   private voiceCallsSocket?: Promise<{ disconnect: () => unknown }>;
 
   private reconnectAttempts = 0;
+  /** Consecutive 440 (connectionReplaced) closes; reset like reconnectAttempts (see #56). */
+  private conflictCloses = 0;
   private reconnectTimer?: NodeJS.Timeout;
   private stableConnectionTimer?: NodeJS.Timeout;
 
@@ -443,30 +427,15 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (qr) {
-      if (this.instance.qrcode.count === this.configService.get<QrCode>('QRCODE').LIMIT) {
-        this.sendDataWebhook(Events.QRCODE_UPDATED, {
-          message: 'QR code limit reached, please login again',
-          statusCode: DisconnectReason.badSession,
-        });
-
-        if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
-          this.chatwootService.eventWhatsapp(
-            Events.QRCODE_UPDATED,
-            { instanceName: this.instance.name, instanceId: this.instanceId },
-            { message: 'QR code limit reached, please login again', statusCode: DisconnectReason.badSession },
-          );
-        }
-
-        this.sendDataWebhook(Events.CONNECTION_UPDATE, {
-          instance: this.instance.name,
-          state: 'refused',
-          statusReason: DisconnectReason.connectionClosed,
-          wuid: this.instance.wuid,
-          profileName: await this.getProfileName(),
-          profilePictureUrl: this.instance.profilePictureUrl,
-        });
-
+      // The count spans the whole pairing across our own retries (see #56); connectToWhatsapp and 'open' reset it.
+      if (this.instance.qrcode.count >= this.configService.get<QrCode>('QRCODE').LIMIT) {
+        // endSession makes eventHandler drop every later event of this socket, including the close that the logout
+        // in 'no.connection' produces, so the pairing is stopped here rather than in the close branch.
         this.endSession = true;
+        await this.stopUnscannedPairing(DisconnectReason.timedOut, {
+          error: new Boom('QR code limit reached', { statusCode: DisconnectReason.timedOut }),
+          date: new Date(),
+        });
 
         return this.eventEmitter.emit('no.connection', this.instance.name);
       }
@@ -535,11 +504,19 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if (connection === 'close') {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
-      const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
-      const shouldReconnect = !codesToNotReconnect.includes(statusCode);
       this.clearStableConnectionTimer();
+      this.conflictCloses = nextConflictCount(this.conflictCloses, statusCode);
 
-      if (shouldReconnect) {
+      const decision = decideOnClose({
+        statusCode,
+        paired: !!this.instance.authState?.state?.creds?.account,
+        qrCount: this.instance.qrcode?.count ?? 0,
+        qrLimit: this.configService.get<QrCode>('QRCODE').LIMIT,
+        conflictCount: this.conflictCloses,
+        conflictLimit: this.configService.get<Reconnect>('RECONNECT').CONFLICT_LIMIT,
+      });
+
+      if (decision.action === 'retry') {
         if (generation !== this.clientGeneration) {
           return;
         }
@@ -547,6 +524,21 @@ export class BaileysStartupService extends ChannelStartupService {
         if (this.reconnectTimer) {
           await this.reportReconnecting(statusCode, lastDisconnect);
         }
+      } else if (decision.action === 'stop-keep-session') {
+        // Another client holds these credentials (see #56). Stop fighting it, but keep the session: once the other
+        // client is gone, GET /instance/connect or a restart resumes without a new QR scan. No logout.instance here,
+        // its cleanup deletes the session.
+        this.logger.warn(
+          `Connection replaced ${this.conflictCloses} times in a row (440), stopped retrying; ` +
+            'another client is using this session',
+        );
+        this.stopReconnecting();
+        await this.markClosed(statusCode, lastDisconnect);
+
+        this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
+      } else if (decision.reason === 'qr-limit') {
+        // The pairing socket closed (428/408) after the last allowed QR code was shown.
+        await this.stopUnscannedPairing(statusCode, lastDisconnect);
       } else {
         this.stopReconnecting();
         await this.markClosed(statusCode, lastDisconnect);
@@ -561,6 +553,8 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if (connection === 'open') {
       this.startStableConnectionTimer(generation);
+      // A pairing that reached 'open' is over: the next one starts a fresh QR count.
+      this.instance.qrcode.count = 0;
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
@@ -590,6 +584,8 @@ export class BaileysStartupService extends ChannelStartupService {
           profileName: (await this.getProfileName()) as string,
           profilePicUrl: this.instance.profilePictureUrl,
           connectionStatus: 'open',
+          // Don't leave the last close's code on an open row (see #56); disconnectionAt stays as history.
+          disconnectionReasonCode: null,
         },
       });
 
@@ -614,6 +610,54 @@ export class BaileysStartupService extends ChannelStartupService {
     if (connection === 'connecting') {
       this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
     }
+  }
+
+  /**
+   * Ends an unscanned pairing once QRCODE_LIMIT codes were shown in it (see #56). Like a non-retried close: the row
+   * ends 'close' with the close code, so it is not auto-connected at boot and pairing starts again only from
+   * GET /instance/connect. logout.instance only drops the unlinked pairing creds: a later connect makes new ones.
+   */
+  private async stopUnscannedPairing(
+    statusCode: number | undefined,
+    lastDisconnect: ConnectionState['lastDisconnect'],
+  ) {
+    this.logger.warn(
+      `QR code limit (${this.configService.get<QrCode>('QRCODE').LIMIT}) reached without a scan, stopped retrying; ` +
+        'call GET /instance/connect to pair again',
+    );
+    this.stopReconnecting();
+    this.stateConnection = { state: 'close', statusReason: statusCode };
+
+    await this.notifyQrLimitReached();
+    await this.markClosed(statusCode, lastDisconnect);
+
+    this.eventEmitter.emit('logout.instance', this.instance.name, 'inner');
+    this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
+  }
+
+  /** QRCODE_LIMIT codes were shown without a scan: tell webhook and Chatwoot consumers the pairing was refused. */
+  private async notifyQrLimitReached() {
+    this.sendDataWebhook(Events.QRCODE_UPDATED, {
+      message: 'QR code limit reached, please login again',
+      statusCode: DisconnectReason.badSession,
+    });
+
+    if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+      this.chatwootService.eventWhatsapp(
+        Events.QRCODE_UPDATED,
+        { instanceName: this.instance.name, instanceId: this.instanceId },
+        { message: 'QR code limit reached, please login again', statusCode: DisconnectReason.badSession },
+      );
+    }
+
+    this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+      instance: this.instance.name,
+      state: 'refused',
+      statusReason: DisconnectReason.connectionClosed,
+      wuid: this.instance.wuid,
+      profileName: await this.getProfileName(),
+      profilePictureUrl: this.instance.profilePictureUrl,
+    });
   }
 
   private async getMessage(key: proto.IMessageKey, full = false) {
@@ -884,10 +928,12 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   /**
-   * Public entry point (API connect, boot auto-connect, restart, Chatwoot): starts a fresh reconnect budget.
+   * Public entry point (API connect, boot auto-connect, restart, Chatwoot): starts a fresh reconnect budget and a
+   * fresh QR count (see #56). Our own retries go through openSocket and keep both.
    */
   public async connectToWhatsapp(number?: string): Promise<WASocket> {
     this.stopReconnecting();
+    this.instance.qrcode.count = 0;
     return this.openSocket(number);
   }
 
@@ -922,7 +968,7 @@ export class BaileysStartupService extends ChannelStartupService {
     await this.connectToWhatsapp(this.phoneNumber);
   }
 
-  /** Cancels any scheduled reconnect and resets the attempt counter (logout, delete, manual connect). */
+  /** Cancels any scheduled reconnect and resets the attempt counters (logout, delete, manual connect). */
   public stopReconnecting() {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
@@ -930,6 +976,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
     this.clearStableConnectionTimer();
     this.reconnectAttempts = 0;
+    this.conflictCloses = 0;
   }
 
   private clearStableConnectionTimer() {
@@ -948,6 +995,7 @@ export class BaileysStartupService extends ChannelStartupService {
           this.logger.info(`Connection stable for ${STABLE_CONNECTION_MS / 1000}s, reconnect attempts reset`);
         }
         this.reconnectAttempts = 0;
+        this.conflictCloses = 0;
       }
     }, STABLE_CONNECTION_MS);
   }

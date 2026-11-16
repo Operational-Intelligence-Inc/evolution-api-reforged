@@ -10,6 +10,7 @@
     "start:prod": "node dist/main",
     "dev:server": "tsup --watch src",
     "test": "tsx watch ./test/all.test.ts",
+    "test:run": "tsx --test ./test/all.test.ts",
     "lint": "eslint --fix --ext .ts src",
     "lint:check": "eslint --ext .ts src",
     "commit": "cz",
