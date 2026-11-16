@@ -62,6 +62,7 @@ import { CacheService } from '@api/services/cache.service';
 import { ChannelStartupService } from '@api/services/channel.service';
 import { Events, MessageSubtype, TypeMediaMessage, wa } from '@api/types/wa.types';
 import { CacheEngine } from '@cache/cacheengine';
+import { redisClient } from '@cache/rediscache.client';
 import {
   AudioConverter,
   CacheConf,
@@ -70,10 +71,12 @@ import {
   configService,
   ConfigSessionPhone,
   Database,
+  EventQueueConf,
   Log,
   Openai,
   ProviderSession,
   QrCode,
+  Reconnect,
   S3,
 } from '@config/env.config';
 import { BadRequestException, InternalServerErrorException, NotFoundException } from '@exceptions';
@@ -156,7 +159,9 @@ import sharp from 'sharp';
 import { PassThrough, Readable } from 'stream';
 import { v4 } from 'uuid';
 
+import { BaileysEventQueue, EventMap, QueueItemContext } from './baileys-event-queue';
 import { BaileysMessageProcessor } from './baileysMessage.processor';
+import { decideOnClose, nextConflictCount, reconnectDelayMs, STABLE_CONNECTION_MS } from './reconnect.policy';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 
 export interface ExtendedIMessageKey extends proto.IMessageKey {
@@ -182,17 +187,6 @@ const CALL_EVENTS = ['CB:call', 'CB:ack,class:call'] as const;
 const STATUS_STANZA_EVENT = 'CB:status';
 
 /**
- * Reconnect policy for retryable closes (see #10). Delay before attempt N is RECONNECT_DELAYS_MS[N - 1], and the last
- * value repeats. There is no attempt cap (see #51): a retryable close is retried every 5 min until it succeeds, so an
- * outage of any length recovers on its own and the row stays 'connecting' (auto-connected at boot). Only logout,
- * delete and a manual connect stop the loop (stopReconnecting).
- * The attempt counter resets only after the connection has stayed open for STABLE_CONNECTION_MS: in a 440 loop every
- * attempt briefly reaches 'open', so resetting on any open would keep the delays at their shortest.
- */
-export const RECONNECT_DELAYS_MS = [1_000, 2_000, 5_000, 15_000, 30_000, 60_000, 120_000, 300_000];
-export const STABLE_CONNECTION_MS = 60_000;
-
-/**
  * Whether an inbound edit comes from the author of the stored message it targets (see #25). The lookup already
  * matched the chat and fromMe, which settles 1:1 chats and our own edits. In groups, the sender (participant, in LID
  * or PN form) must be one of the original's participant forms.
@@ -213,15 +207,6 @@ export function isSameAuthor(originalKey: ExtendedIMessageKey, edit: proto.IWebM
   const senders = forms(editKey.participant, editKey.participantAlt, edit?.participant);
 
   return [...senders].some((jid) => authors.has(jid));
-}
-
-export function reconnectDelayMs(attempt: number, statusCode?: number): number {
-  // 515 (restart required) is the normal restart right after pairing: reconnect at once the first time.
-  if (attempt === 1 && statusCode === DisconnectReason.restartRequired) {
-    return 0;
-  }
-
-  return RECONNECT_DELAYS_MS[Math.min(Math.max(attempt, 1), RECONNECT_DELAYS_MS.length) - 1];
 }
 
 export const LID_MAPPING_MAX_ENTRIES = 200;
@@ -333,7 +318,7 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false });
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
-  private eventProcessingQueue: Promise<void> = Promise.resolve();
+  private eventQueueInstance?: BaileysEventQueue;
 
   /**
    * Socket lifecycle guards (see #4).
@@ -350,6 +335,8 @@ export class BaileysStartupService extends ChannelStartupService {
   private voiceCallsSocket?: Promise<{ disconnect: () => unknown }>;
 
   private reconnectAttempts = 0;
+  /** Consecutive 440 (connectionReplaced) closes; reset like reconnectAttempts (see #56). */
+  private conflictCloses = 0;
   private reconnectTimer?: NodeJS.Timeout;
   private stableConnectionTimer?: NodeJS.Timeout;
 
@@ -363,6 +350,40 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public get connectionStatus() {
     return this.stateConnection;
+  }
+
+  /**
+   * Per-instance event queue (see #50), created on first use because the instance id is only known after
+   * setInstance(). Persists to Redis when CACHE_REDIS_ENABLED and EVENT_QUEUE_PERSIST are on.
+   */
+  private get eventQueue(): BaileysEventQueue {
+    if (!this.eventQueueInstance) {
+      const cache = this.configService.get<CacheConf>('CACHE');
+      const conf = this.configService.get<EventQueueConf>('EVENT_QUEUE');
+      const persist = !!cache?.REDIS?.ENABLED && conf.PERSIST;
+
+      this.eventQueueInstance = new BaileysEventQueue({
+        instanceId: this.instanceId,
+        logger: this.logger,
+        redis: persist ? redisClient.getConnection() : null,
+        prefix: cache?.REDIS?.PREFIX_KEY || 'evolution-cache',
+        itemTimeoutMs: conf.ITEM_TIMEOUT_MS,
+        maxEntryBytes: conf.MAX_ENTRY_BYTES,
+        maxLength: conf.MAX_LENGTH,
+      });
+    }
+
+    return this.eventQueueInstance;
+  }
+
+  /** Lag of this instance's event queue, so consumers can alert on a stalled instance that still reads 'open'. */
+  public eventQueueHealth() {
+    return this.eventQueue.health();
+  }
+
+  /** Drops the persisted events (logout, instance delete): they must not be replayed for a new session. */
+  public async clearEventQueue() {
+    await this.eventQueue.clear();
   }
 
   public async logoutInstance() {
@@ -398,6 +419,8 @@ export class BaileysStartupService extends ChannelStartupService {
     if (sessionExists) {
       await this.prismaRepository.session.delete({ where: { sessionId: this.instanceId } });
     }
+
+    await this.clearEventQueue();
   }
 
   public async getProfileName() {
@@ -443,30 +466,15 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (qr) {
-      if (this.instance.qrcode.count === this.configService.get<QrCode>('QRCODE').LIMIT) {
-        this.sendDataWebhook(Events.QRCODE_UPDATED, {
-          message: 'QR code limit reached, please login again',
-          statusCode: DisconnectReason.badSession,
-        });
-
-        if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
-          this.chatwootService.eventWhatsapp(
-            Events.QRCODE_UPDATED,
-            { instanceName: this.instance.name, instanceId: this.instanceId },
-            { message: 'QR code limit reached, please login again', statusCode: DisconnectReason.badSession },
-          );
-        }
-
-        this.sendDataWebhook(Events.CONNECTION_UPDATE, {
-          instance: this.instance.name,
-          state: 'refused',
-          statusReason: DisconnectReason.connectionClosed,
-          wuid: this.instance.wuid,
-          profileName: await this.getProfileName(),
-          profilePictureUrl: this.instance.profilePictureUrl,
-        });
-
+      // The count spans the whole pairing across our own retries (see #56); connectToWhatsapp and 'open' reset it.
+      if (this.instance.qrcode.count >= this.configService.get<QrCode>('QRCODE').LIMIT) {
+        // endSession makes eventHandler drop every later event of this socket, including the close that the logout
+        // in 'no.connection' produces, so the pairing is stopped here rather than in the close branch.
         this.endSession = true;
+        await this.stopUnscannedPairing(DisconnectReason.timedOut, {
+          error: new Boom('QR code limit reached', { statusCode: DisconnectReason.timedOut }),
+          date: new Date(),
+        });
 
         return this.eventEmitter.emit('no.connection', this.instance.name);
       }
@@ -535,11 +543,19 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if (connection === 'close') {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
-      const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
-      const shouldReconnect = !codesToNotReconnect.includes(statusCode);
       this.clearStableConnectionTimer();
+      this.conflictCloses = nextConflictCount(this.conflictCloses, statusCode);
 
-      if (shouldReconnect) {
+      const decision = decideOnClose({
+        statusCode,
+        paired: !!this.instance.authState?.state?.creds?.account,
+        qrCount: this.instance.qrcode?.count ?? 0,
+        qrLimit: this.configService.get<QrCode>('QRCODE').LIMIT,
+        conflictCount: this.conflictCloses,
+        conflictLimit: this.configService.get<Reconnect>('RECONNECT').CONFLICT_LIMIT,
+      });
+
+      if (decision.action === 'retry') {
         if (generation !== this.clientGeneration) {
           return;
         }
@@ -547,6 +563,21 @@ export class BaileysStartupService extends ChannelStartupService {
         if (this.reconnectTimer) {
           await this.reportReconnecting(statusCode, lastDisconnect);
         }
+      } else if (decision.action === 'stop-keep-session') {
+        // Another client holds these credentials (see #56). Stop fighting it, but keep the session: once the other
+        // client is gone, GET /instance/connect or a restart resumes without a new QR scan. No logout.instance here,
+        // its cleanup deletes the session.
+        this.logger.warn(
+          `Connection replaced ${this.conflictCloses} times in a row (440), stopped retrying; ` +
+            'another client is using this session',
+        );
+        this.stopReconnecting();
+        await this.markClosed(statusCode, lastDisconnect);
+
+        this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
+      } else if (decision.reason === 'qr-limit') {
+        // The pairing socket closed (428/408) after the last allowed QR code was shown.
+        await this.stopUnscannedPairing(statusCode, lastDisconnect);
       } else {
         this.stopReconnecting();
         await this.markClosed(statusCode, lastDisconnect);
@@ -561,6 +592,8 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if (connection === 'open') {
       this.startStableConnectionTimer(generation);
+      // A pairing that reached 'open' is over: the next one starts a fresh QR count.
+      this.instance.qrcode.count = 0;
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
@@ -590,6 +623,8 @@ export class BaileysStartupService extends ChannelStartupService {
           profileName: (await this.getProfileName()) as string,
           profilePicUrl: this.instance.profilePictureUrl,
           connectionStatus: 'open',
+          // Don't leave the last close's code on an open row (see #56); disconnectionAt stays as history.
+          disconnectionReasonCode: null,
         },
       });
 
@@ -614,6 +649,54 @@ export class BaileysStartupService extends ChannelStartupService {
     if (connection === 'connecting') {
       this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
     }
+  }
+
+  /**
+   * Ends an unscanned pairing once QRCODE_LIMIT codes were shown in it (see #56). Like a non-retried close: the row
+   * ends 'close' with the close code, so it is not auto-connected at boot and pairing starts again only from
+   * GET /instance/connect. logout.instance only drops the unlinked pairing creds: a later connect makes new ones.
+   */
+  private async stopUnscannedPairing(
+    statusCode: number | undefined,
+    lastDisconnect: ConnectionState['lastDisconnect'],
+  ) {
+    this.logger.warn(
+      `QR code limit (${this.configService.get<QrCode>('QRCODE').LIMIT}) reached without a scan, stopped retrying; ` +
+        'call GET /instance/connect to pair again',
+    );
+    this.stopReconnecting();
+    this.stateConnection = { state: 'close', statusReason: statusCode };
+
+    await this.notifyQrLimitReached();
+    await this.markClosed(statusCode, lastDisconnect);
+
+    this.eventEmitter.emit('logout.instance', this.instance.name, 'inner');
+    this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
+  }
+
+  /** QRCODE_LIMIT codes were shown without a scan: tell webhook and Chatwoot consumers the pairing was refused. */
+  private async notifyQrLimitReached() {
+    this.sendDataWebhook(Events.QRCODE_UPDATED, {
+      message: 'QR code limit reached, please login again',
+      statusCode: DisconnectReason.badSession,
+    });
+
+    if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+      this.chatwootService.eventWhatsapp(
+        Events.QRCODE_UPDATED,
+        { instanceName: this.instance.name, instanceId: this.instanceId },
+        { message: 'QR code limit reached, please login again', statusCode: DisconnectReason.badSession },
+      );
+    }
+
+    this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+      instance: this.instance.name,
+      state: 'refused',
+      statusReason: DisconnectReason.connectionClosed,
+      wuid: this.instance.wuid,
+      profileName: await this.getProfileName(),
+      profilePictureUrl: this.instance.profilePictureUrl,
+    });
   }
 
   private async getMessage(key: proto.IMessageKey, full = false) {
@@ -862,6 +945,10 @@ export class BaileysStartupService extends ChannelStartupService {
       this.voiceCallsSocket = useVoiceCallsBaileys(this.localSettings.wavoipToken, client, 'connecting');
     }
 
+    // Events persisted by a previous process run first. Issued before eventHandler() attaches, so no live event can
+    // be read back as a replayed one; runs once per instance (later sockets share the same in-memory queue).
+    this.eventQueue.replay((events, ctx) => this.processEvents(events, null, ctx));
+
     this.eventHandler(client, generation);
 
     for (const event of CALL_EVENTS) {
@@ -884,10 +971,12 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   /**
-   * Public entry point (API connect, boot auto-connect, restart, Chatwoot): starts a fresh reconnect budget.
+   * Public entry point (API connect, boot auto-connect, restart, Chatwoot): starts a fresh reconnect budget and a
+   * fresh QR count (see #56). Our own retries go through openSocket and keep both.
    */
   public async connectToWhatsapp(number?: string): Promise<WASocket> {
     this.stopReconnecting();
+    this.instance.qrcode.count = 0;
     return this.openSocket(number);
   }
 
@@ -922,7 +1011,7 @@ export class BaileysStartupService extends ChannelStartupService {
     await this.connectToWhatsapp(this.phoneNumber);
   }
 
-  /** Cancels any scheduled reconnect and resets the attempt counter (logout, delete, manual connect). */
+  /** Cancels any scheduled reconnect and resets the attempt counters (logout, delete, manual connect). */
   public stopReconnecting() {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
@@ -930,6 +1019,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
     this.clearStableConnectionTimer();
     this.reconnectAttempts = 0;
+    this.conflictCloses = 0;
   }
 
   private clearStableConnectionTimer() {
@@ -948,6 +1038,7 @@ export class BaileysStartupService extends ChannelStartupService {
           this.logger.info(`Connection stable for ${STABLE_CONNECTION_MS / 1000}s, reconnect attempts reset`);
         }
         this.reconnectAttempts = 0;
+        this.conflictCloses = 0;
       }
     }, STABLE_CONNECTION_MS);
   }
@@ -2182,153 +2273,188 @@ export class BaileysStartupService extends ChannelStartupService {
     },
   };
 
+  /**
+   * Queues every event batch from the socket on the instance's event queue (see #50). The persistable part is written
+   * to Redis right here, synchronously, so stream order matches arrival order and nothing awaits Redis.
+   */
   private eventHandler(client: WASocket, generation: number) {
     this.clientEventsUnsubscribe = client.ev.process(async (events) => {
       if (generation !== this.clientGeneration) {
         return;
       }
 
-      this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
-        try {
-          // Re-check when dequeued: the socket may have been replaced while earlier events were being processed.
-          if (generation !== this.clientGeneration) {
-            return;
-          }
+      const entryId = this.eventQueue.persist(events);
 
-          if (!this.endSession) {
-            const database = this.configService.get<Database>('DATABASE');
-            const settings = await this.findSettings();
-
-            if (events.call) {
-              const call = events.call[0];
-
-              if (settings?.rejectCall && call.status == 'offer') {
-                this.client.rejectCall(call.id, call.from);
-              }
-
-              if (settings?.msgCall?.trim().length > 0 && call.status == 'offer') {
-                if (call.from.endsWith('@lid')) {
-                  call.from = await this.client.signalRepository.lidMapping.getPNForLID(call.from as string);
-                }
-                const msg = await this.client.sendMessage(call.from, { text: settings.msgCall });
-
-                this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
-              }
-
-              this.sendDataWebhook(Events.CALL, call);
-            }
-
-            if (events['connection.update']) {
-              this.connectionUpdate(events['connection.update'], generation);
-            }
-
-            if (events['creds.update']) {
-              this.instance.authState.saveCreds();
-            }
-
-            if (events['messaging-history.set']) {
-              const payload = events['messaging-history.set'];
-              await this.messageHandle['messaging-history.set'](payload);
-            }
-
-            if (events['messages.upsert']) {
-              const payload = events['messages.upsert'];
-
-              // this.messageProcessor.processMessage(payload, settings);
-              await this.messageHandle['messages.upsert'](payload, settings);
-            }
-
-            if (events['messages.update']) {
-              const payload = events['messages.update'];
-              await this.messageHandle['messages.update'](payload, settings);
-            }
-
-            if (events['message-receipt.update']) {
-              const payload = events['message-receipt.update'] as MessageUserReceiptUpdate[];
-              const remotesJidMap: Record<string, number> = {};
-
-              for (const event of payload) {
-                if (typeof event.key.remoteJid === 'string' && typeof event.receipt.readTimestamp === 'number') {
-                  remotesJidMap[event.key.remoteJid] = event.receipt.readTimestamp;
-                }
-              }
-
-              await Promise.all(
-                Object.keys(remotesJidMap).map(async (remoteJid) =>
-                  this.updateMessagesReadedByTimestamp(remoteJid, remotesJidMap[remoteJid]),
-                ),
-              );
-            }
-
-            if (events['presence.update']) {
-              const payload = events['presence.update'];
-
-              if (settings?.groupsIgnore && payload.id.includes('@g.us')) {
-                return;
-              }
-
-              this.sendDataWebhook(Events.PRESENCE_UPDATE, payload);
-            }
-
-            if (!settings?.groupsIgnore) {
-              if (events['groups.upsert']) {
-                const payload = events['groups.upsert'];
-                this.groupHandler['groups.upsert'](payload);
-              }
-
-              if (events['groups.update']) {
-                const payload = events['groups.update'];
-                this.groupHandler['groups.update'](payload);
-              }
-
-              if (events['group-participants.update']) {
-                const payload = events['group-participants.update'] as any;
-                this.groupHandler['group-participants.update'](payload);
-              }
-            }
-
-            if (events['chats.upsert']) {
-              const payload = events['chats.upsert'];
-              this.chatHandle['chats.upsert'](payload);
-            }
-
-            if (events['chats.update']) {
-              const payload = events['chats.update'];
-              this.chatHandle['chats.update'](payload);
-            }
-
-            if (events['chats.delete']) {
-              const payload = events['chats.delete'];
-              this.chatHandle['chats.delete'](payload);
-            }
-
-            if (events['contacts.upsert']) {
-              const payload = events['contacts.upsert'];
-              this.contactHandle['contacts.upsert'](payload);
-            }
-
-            if (events['contacts.update']) {
-              const payload = events['contacts.update'];
-              this.contactHandle['contacts.update'](payload);
-            }
-
-            if (events[Events.LABELS_ASSOCIATION]) {
-              const payload = events[Events.LABELS_ASSOCIATION];
-              this.labelHandle[Events.LABELS_ASSOCIATION](payload, database);
-              return;
-            }
-
-            if (events[Events.LABELS_EDIT]) {
-              const payload = events[Events.LABELS_EDIT];
-              this.labelHandle[Events.LABELS_EDIT](payload);
-              return;
-            }
-          }
-        } catch (error) {
-          this.logger.error(error);
-        }
-      });
+      this.eventQueue.enqueue(
+        Object.keys(events),
+        (ctx) => this.processEvents(events as EventMap, generation, ctx),
+        entryId,
+      );
     });
+  }
+
+  /**
+   * Processes one event batch, live (generation = the socket it came from) or replayed from Redis (generation = null).
+   *
+   * Socket-lifecycle events (call, connection.update, creds.update, presence.update) are only acted on while their
+   * socket is still current: a late `close` from a replaced socket must never trigger a reconnect. Data events are
+   * always processed: WhatsApp already considers them delivered and will not send them again.
+   *
+   * Each handler runs as its own step: the step name is what a queue timeout reports, and one failing handler no
+   * longer skips the rest of the batch.
+   */
+  private async processEvents(events: EventMap, generation: number | null, ctx: QueueItemContext) {
+    if (this.endSession) {
+      return;
+    }
+
+    const step = async (name: string, run: () => unknown) => {
+      ctx.step = name;
+      try {
+        await run();
+      } catch (error) {
+        this.logger.error({ localError: `event handler ${name}`, error: error?.message ?? error, stack: error?.stack });
+      }
+    };
+
+    const isLive = generation !== null;
+    const socketCurrent = isLive && generation === this.clientGeneration;
+    const database = this.configService.get<Database>('DATABASE');
+
+    let settings: any;
+    ctx.step = 'findSettings';
+    try {
+      settings = await this.findSettings();
+    } catch (error) {
+      this.logger.error({ localError: 'event handler findSettings', error: error?.message ?? error });
+    }
+
+    if (socketCurrent) {
+      if (events.call) {
+        await step('call', async () => {
+          const call = events.call[0];
+
+          if (settings?.rejectCall && call.status == 'offer') {
+            this.client.rejectCall(call.id, call.from);
+          }
+
+          if (settings?.msgCall?.trim().length > 0 && call.status == 'offer') {
+            if (call.from.endsWith('@lid')) {
+              call.from = await this.client.signalRepository.lidMapping.getPNForLID(call.from as string);
+            }
+            const msg = await this.client.sendMessage(call.from, { text: settings.msgCall });
+
+            this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
+          }
+
+          this.sendDataWebhook(Events.CALL, call);
+        });
+      }
+
+      if (events['connection.update']) {
+        ctx.step = 'connection.update';
+        // Not awaited, as before: it can wait on reconnect bookkeeping that must not hold the queue.
+        this.connectionUpdate(events['connection.update'], generation).catch((error) =>
+          this.logger.error({ localError: 'connection.update', error: error?.message ?? error }),
+        );
+      }
+
+      if (events['creds.update']) {
+        ctx.step = 'creds.update';
+        Promise.resolve(this.instance.authState.saveCreds()).catch((error) =>
+          this.logger.error({ localError: 'creds.update', error: error?.message ?? error }),
+        );
+      }
+
+      if (events['presence.update']) {
+        const payload = events['presence.update'];
+
+        if (!(settings?.groupsIgnore && payload.id.includes('@g.us'))) {
+          this.sendDataWebhook(Events.PRESENCE_UPDATE, payload);
+        }
+      }
+    }
+
+    if (events['messaging-history.set']) {
+      await step('messaging-history.set', () =>
+        this.messageHandle['messaging-history.set'](events['messaging-history.set']),
+      );
+    }
+
+    if (events['messages.upsert']) {
+      await step('messages.upsert', () => this.messageHandle['messages.upsert'](events['messages.upsert'], settings));
+    }
+
+    if (events['messages.update']) {
+      await step('messages.update', () => this.messageHandle['messages.update'](events['messages.update'], settings));
+    }
+
+    if (events['message-receipt.update']) {
+      await step('message-receipt.update', async () => {
+        const payload = events['message-receipt.update'] as MessageUserReceiptUpdate[];
+        const remotesJidMap: Record<string, number> = {};
+
+        for (const event of payload) {
+          if (typeof event.key.remoteJid === 'string' && typeof event.receipt.readTimestamp === 'number') {
+            remotesJidMap[event.key.remoteJid] = event.receipt.readTimestamp;
+          }
+        }
+
+        await Promise.all(
+          Object.keys(remotesJidMap).map(async (remoteJid) =>
+            this.updateMessagesReadedByTimestamp(remoteJid, remotesJidMap[remoteJid]),
+          ),
+        );
+      });
+    }
+
+    if (!settings?.groupsIgnore) {
+      if (events['groups.upsert']) {
+        await step('groups.upsert', () => this.groupHandler['groups.upsert'](events['groups.upsert']));
+      }
+
+      if (events['groups.update']) {
+        await step('groups.update', () => this.groupHandler['groups.update'](events['groups.update']));
+      }
+
+      if (events['group-participants.update']) {
+        await step('group-participants.update', () =>
+          this.groupHandler['group-participants.update'](events['group-participants.update'] as any),
+        );
+      }
+    }
+
+    if (events['chats.upsert']) {
+      await step('chats.upsert', () => this.chatHandle['chats.upsert'](events['chats.upsert']));
+    }
+
+    if (events['chats.update']) {
+      await step('chats.update', () => this.chatHandle['chats.update'](events['chats.update']));
+    }
+
+    if (events['chats.delete']) {
+      await step('chats.delete', () => this.chatHandle['chats.delete'](events['chats.delete']));
+    }
+
+    if (events['contacts.upsert']) {
+      await step('contacts.upsert', () => this.contactHandle['contacts.upsert'](events['contacts.upsert']));
+    }
+
+    if (events['contacts.update']) {
+      await step('contacts.update', () => this.contactHandle['contacts.update'](events['contacts.update']));
+    }
+
+    if (events[Events.LABELS_ASSOCIATION]) {
+      await step(Events.LABELS_ASSOCIATION, () =>
+        this.labelHandle[Events.LABELS_ASSOCIATION](events[Events.LABELS_ASSOCIATION], database),
+      );
+    }
+
+    if (events[Events.LABELS_EDIT]) {
+      await step(Events.LABELS_EDIT, () => this.labelHandle[Events.LABELS_EDIT](events[Events.LABELS_EDIT]));
+    }
+
+    ctx.step = undefined;
   }
 
   private historySyncNotification(msg: proto.Message.IHistorySyncNotification) {

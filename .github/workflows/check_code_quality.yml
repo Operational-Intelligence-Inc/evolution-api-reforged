@@ -35,6 +35,9 @@ jobs:
     - name: Check linting
       run: npm run lint:check
 
+    - name: Run unit tests
+      run: npm run test:run
+
     - name: Generate Prisma client
       run: npm run db:generate
 

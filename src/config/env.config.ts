@@ -336,6 +336,16 @@ export type CacheConfRedis = {
   TTL: number;
   SAVE_INSTANCES: boolean;
 };
+/**
+ * Per-instance Baileys event queue (see #50): data events are persisted to a Redis stream on receipt and acked once
+ * processed, so a restart replays what was still queued. Persistence needs CACHE_REDIS_ENABLED.
+ */
+export type EventQueueConf = {
+  PERSIST: boolean;
+  ITEM_TIMEOUT_MS: number;
+  MAX_ENTRY_BYTES: number;
+  MAX_LENGTH: number;
+};
 export type CacheConfLocal = {
   ENABLED: boolean;
   TTL: number;
@@ -359,6 +369,7 @@ export type Webhook = {
 export type Pusher = { ENABLED: boolean; GLOBAL?: GlobalPusher; EVENTS: EventsPusher };
 export type ConfigSessionPhone = { CLIENT: string; NAME: string };
 export type QrCode = { LIMIT: number; COLOR: string };
+export type Reconnect = { CONFLICT_LIMIT: number };
 export type Typebot = { ENABLED: boolean; API_VERSION: string; SEND_MEDIA_BASE64: boolean };
 export type Chatwoot = {
   ENABLED: boolean;
@@ -456,6 +467,7 @@ export interface Env {
   PUSHER: Pusher;
   CONFIG_SESSION_PHONE: ConfigSessionPhone;
   QRCODE: QrCode;
+  RECONNECT: Reconnect;
   TYPEBOT: Typebot;
   CHATWOOT: Chatwoot;
   OPENAI: Openai;
@@ -464,6 +476,7 @@ export interface Env {
   EVOAI: Evoai;
   FLOWISE: Flowise;
   CACHE: CacheConf;
+  EVENT_QUEUE: EventQueueConf;
   S3?: S3;
   AUTHENTICATION: Auth;
   METRICS: Metrics;
@@ -847,6 +860,13 @@ export class ConfigService {
         LIMIT: Number.parseInt(process.env.QRCODE_LIMIT) || 30,
         COLOR: process.env.QRCODE_COLOR || '#198754',
       },
+      RECONNECT: {
+        // 0 is a valid value (unlimited), so only a missing or invalid value falls back to the default.
+        CONFLICT_LIMIT: (() => {
+          const limit = Number.parseInt(process.env?.RECONNECT_CONFLICT_LIMIT);
+          return Number.isFinite(limit) && limit >= 0 ? limit : 10;
+        })(),
+      },
       TYPEBOT: {
         ENABLED: process.env?.TYPEBOT_ENABLED === 'true',
         API_VERSION: process.env?.TYPEBOT_API_VERSION || 'old',
@@ -894,6 +914,12 @@ export class ConfigService {
           ENABLED: process.env?.CACHE_LOCAL_ENABLED === 'true',
           TTL: Number.parseInt(process.env?.CACHE_REDIS_TTL) || 86400,
         },
+      },
+      EVENT_QUEUE: {
+        PERSIST: process.env?.EVENT_QUEUE_PERSIST !== 'false',
+        ITEM_TIMEOUT_MS: Number.parseInt(process.env?.EVENT_QUEUE_ITEM_TIMEOUT_MS) || 120_000,
+        MAX_ENTRY_BYTES: Number.parseInt(process.env?.EVENT_QUEUE_MAX_ENTRY_BYTES) || 8 * 1024 * 1024,
+        MAX_LENGTH: Number.parseInt(process.env?.EVENT_QUEUE_MAX_LENGTH) || 10_000,
       },
       S3: {
         ACCESS_KEY: process.env?.S3_ACCESS_KEY,
