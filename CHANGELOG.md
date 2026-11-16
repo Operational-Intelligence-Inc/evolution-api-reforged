@@ -1,3 +1,10 @@
+# 3.0.1 (2026-11-15)
+
+### Security
+
+* **Signal session keys no longer reach the logs.** libsignal, the Signal implementation Baileys uses, passes whole session objects to `console.info`/`console.warn` when a session is opened, closed or pruned ("Closing session:", "Opening session:", "Session already closed", "Removing old closed session:"). Those objects hold private ratchet keys and the root key, and the calls bypass `LOG_LEVEL`, so every session change wrote key material to the container log. This affects 3.0.0 and every earlier version. The console is now wrapped at startup, after Sentry, and any Signal session argument is printed as `[Signal session redacted]`; the rest of the line is unchanged.
+  * Logs written by earlier versions still contain these keys: restrict who can read them until they age out.
+
 # 3.0.0 (2026-11-15)
 
 First release of this fork. Images are published to `ghcr.io/operational-intelligence-inc/evolution-api-reforged`.

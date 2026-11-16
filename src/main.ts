@@ -1,5 +1,7 @@
 // Import this first from sentry instrument!
 import '@utils/instrumentSentry';
+// Then wrap the console (outside Sentry's wrapper) so libsignal can't print session keys.
+import '@utils/redactConsole';
 
 // Now import other modules
 import { ProviderFiles } from '@api/provider/sessions';
