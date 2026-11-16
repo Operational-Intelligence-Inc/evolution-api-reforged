@@ -359,6 +359,7 @@ export type Webhook = {
 export type Pusher = { ENABLED: boolean; GLOBAL?: GlobalPusher; EVENTS: EventsPusher };
 export type ConfigSessionPhone = { CLIENT: string; NAME: string };
 export type QrCode = { LIMIT: number; COLOR: string };
+export type Reconnect = { CONFLICT_LIMIT: number };
 export type Typebot = { ENABLED: boolean; API_VERSION: string; SEND_MEDIA_BASE64: boolean };
 export type Chatwoot = {
   ENABLED: boolean;
@@ -456,6 +457,7 @@ export interface Env {
   PUSHER: Pusher;
   CONFIG_SESSION_PHONE: ConfigSessionPhone;
   QRCODE: QrCode;
+  RECONNECT: Reconnect;
   TYPEBOT: Typebot;
   CHATWOOT: Chatwoot;
   OPENAI: Openai;
@@ -846,6 +848,13 @@ export class ConfigService {
       QRCODE: {
         LIMIT: Number.parseInt(process.env.QRCODE_LIMIT) || 30,
         COLOR: process.env.QRCODE_COLOR || '#198754',
+      },
+      RECONNECT: {
+        // 0 is a valid value (unlimited), so only a missing or invalid value falls back to the default.
+        CONFLICT_LIMIT: (() => {
+          const limit = Number.parseInt(process.env?.RECONNECT_CONFLICT_LIMIT);
+          return Number.isFinite(limit) && limit >= 0 ? limit : 10;
+        })(),
       },
       TYPEBOT: {
         ENABLED: process.env?.TYPEBOT_ENABLED === 'true',
