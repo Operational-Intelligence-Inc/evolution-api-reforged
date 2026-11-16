@@ -62,6 +62,7 @@ import { CacheService } from '@api/services/cache.service';
 import { ChannelStartupService } from '@api/services/channel.service';
 import { Events, MessageSubtype, TypeMediaMessage, wa } from '@api/types/wa.types';
 import { CacheEngine } from '@cache/cacheengine';
+import { redisClient } from '@cache/rediscache.client';
 import {
   AudioConverter,
   CacheConf,
@@ -70,6 +71,7 @@ import {
   configService,
   ConfigSessionPhone,
   Database,
+  EventQueueConf,
   Log,
   Openai,
   ProviderSession,
@@ -157,6 +159,7 @@ import sharp from 'sharp';
 import { PassThrough, Readable } from 'stream';
 import { v4 } from 'uuid';
 
+import { BaileysEventQueue, EventMap, QueueItemContext } from './baileys-event-queue';
 import { BaileysMessageProcessor } from './baileysMessage.processor';
 import { decideOnClose, nextConflictCount, reconnectDelayMs, STABLE_CONNECTION_MS } from './reconnect.policy';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
@@ -315,7 +318,7 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false });
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
-  private eventProcessingQueue: Promise<void> = Promise.resolve();
+  private eventQueueInstance?: BaileysEventQueue;
 
   /**
    * Socket lifecycle guards (see #4).
@@ -347,6 +350,40 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public get connectionStatus() {
     return this.stateConnection;
+  }
+
+  /**
+   * Per-instance event queue (see #50), created on first use because the instance id is only known after
+   * setInstance(). Persists to Redis when CACHE_REDIS_ENABLED and EVENT_QUEUE_PERSIST are on.
+   */
+  private get eventQueue(): BaileysEventQueue {
+    if (!this.eventQueueInstance) {
+      const cache = this.configService.get<CacheConf>('CACHE');
+      const conf = this.configService.get<EventQueueConf>('EVENT_QUEUE');
+      const persist = !!cache?.REDIS?.ENABLED && conf.PERSIST;
+
+      this.eventQueueInstance = new BaileysEventQueue({
+        instanceId: this.instanceId,
+        logger: this.logger,
+        redis: persist ? redisClient.getConnection() : null,
+        prefix: cache?.REDIS?.PREFIX_KEY || 'evolution-cache',
+        itemTimeoutMs: conf.ITEM_TIMEOUT_MS,
+        maxEntryBytes: conf.MAX_ENTRY_BYTES,
+        maxLength: conf.MAX_LENGTH,
+      });
+    }
+
+    return this.eventQueueInstance;
+  }
+
+  /** Lag of this instance's event queue, so consumers can alert on a stalled instance that still reads 'open'. */
+  public eventQueueHealth() {
+    return this.eventQueue.health();
+  }
+
+  /** Drops the persisted events (logout, instance delete): they must not be replayed for a new session. */
+  public async clearEventQueue() {
+    await this.eventQueue.clear();
   }
 
   public async logoutInstance() {
@@ -382,6 +419,8 @@ export class BaileysStartupService extends ChannelStartupService {
     if (sessionExists) {
       await this.prismaRepository.session.delete({ where: { sessionId: this.instanceId } });
     }
+
+    await this.clearEventQueue();
   }
 
   public async getProfileName() {
@@ -905,6 +944,10 @@ export class BaileysStartupService extends ChannelStartupService {
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
       this.voiceCallsSocket = useVoiceCallsBaileys(this.localSettings.wavoipToken, client, 'connecting');
     }
+
+    // Events persisted by a previous process run first. Issued before eventHandler() attaches, so no live event can
+    // be read back as a replayed one; runs once per instance (later sockets share the same in-memory queue).
+    this.eventQueue.replay((events, ctx) => this.processEvents(events, null, ctx));
 
     this.eventHandler(client, generation);
 
@@ -2230,153 +2273,188 @@ export class BaileysStartupService extends ChannelStartupService {
     },
   };
 
+  /**
+   * Queues every event batch from the socket on the instance's event queue (see #50). The persistable part is written
+   * to Redis right here, synchronously, so stream order matches arrival order and nothing awaits Redis.
+   */
   private eventHandler(client: WASocket, generation: number) {
     this.clientEventsUnsubscribe = client.ev.process(async (events) => {
       if (generation !== this.clientGeneration) {
         return;
       }
 
-      this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
-        try {
-          // Re-check when dequeued: the socket may have been replaced while earlier events were being processed.
-          if (generation !== this.clientGeneration) {
-            return;
-          }
+      const entryId = this.eventQueue.persist(events);
 
-          if (!this.endSession) {
-            const database = this.configService.get<Database>('DATABASE');
-            const settings = await this.findSettings();
-
-            if (events.call) {
-              const call = events.call[0];
-
-              if (settings?.rejectCall && call.status == 'offer') {
-                this.client.rejectCall(call.id, call.from);
-              }
-
-              if (settings?.msgCall?.trim().length > 0 && call.status == 'offer') {
-                if (call.from.endsWith('@lid')) {
-                  call.from = await this.client.signalRepository.lidMapping.getPNForLID(call.from as string);
-                }
-                const msg = await this.client.sendMessage(call.from, { text: settings.msgCall });
-
-                this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
-              }
-
-              this.sendDataWebhook(Events.CALL, call);
-            }
-
-            if (events['connection.update']) {
-              this.connectionUpdate(events['connection.update'], generation);
-            }
-
-            if (events['creds.update']) {
-              this.instance.authState.saveCreds();
-            }
-
-            if (events['messaging-history.set']) {
-              const payload = events['messaging-history.set'];
-              await this.messageHandle['messaging-history.set'](payload);
-            }
-
-            if (events['messages.upsert']) {
-              const payload = events['messages.upsert'];
-
-              // this.messageProcessor.processMessage(payload, settings);
-              await this.messageHandle['messages.upsert'](payload, settings);
-            }
-
-            if (events['messages.update']) {
-              const payload = events['messages.update'];
-              await this.messageHandle['messages.update'](payload, settings);
-            }
-
-            if (events['message-receipt.update']) {
-              const payload = events['message-receipt.update'] as MessageUserReceiptUpdate[];
-              const remotesJidMap: Record<string, number> = {};
-
-              for (const event of payload) {
-                if (typeof event.key.remoteJid === 'string' && typeof event.receipt.readTimestamp === 'number') {
-                  remotesJidMap[event.key.remoteJid] = event.receipt.readTimestamp;
-                }
-              }
-
-              await Promise.all(
-                Object.keys(remotesJidMap).map(async (remoteJid) =>
-                  this.updateMessagesReadedByTimestamp(remoteJid, remotesJidMap[remoteJid]),
-                ),
-              );
-            }
-
-            if (events['presence.update']) {
-              const payload = events['presence.update'];
-
-              if (settings?.groupsIgnore && payload.id.includes('@g.us')) {
-                return;
-              }
-
-              this.sendDataWebhook(Events.PRESENCE_UPDATE, payload);
-            }
-
-            if (!settings?.groupsIgnore) {
-              if (events['groups.upsert']) {
-                const payload = events['groups.upsert'];
-                this.groupHandler['groups.upsert'](payload);
-              }
-
-              if (events['groups.update']) {
-                const payload = events['groups.update'];
-                this.groupHandler['groups.update'](payload);
-              }
-
-              if (events['group-participants.update']) {
-                const payload = events['group-participants.update'] as any;
-                this.groupHandler['group-participants.update'](payload);
-              }
-            }
-
-            if (events['chats.upsert']) {
-              const payload = events['chats.upsert'];
-              this.chatHandle['chats.upsert'](payload);
-            }
-
-            if (events['chats.update']) {
-              const payload = events['chats.update'];
-              this.chatHandle['chats.update'](payload);
-            }
-
-            if (events['chats.delete']) {
-              const payload = events['chats.delete'];
-              this.chatHandle['chats.delete'](payload);
-            }
-
-            if (events['contacts.upsert']) {
-              const payload = events['contacts.upsert'];
-              this.contactHandle['contacts.upsert'](payload);
-            }
-
-            if (events['contacts.update']) {
-              const payload = events['contacts.update'];
-              this.contactHandle['contacts.update'](payload);
-            }
-
-            if (events[Events.LABELS_ASSOCIATION]) {
-              const payload = events[Events.LABELS_ASSOCIATION];
-              this.labelHandle[Events.LABELS_ASSOCIATION](payload, database);
-              return;
-            }
-
-            if (events[Events.LABELS_EDIT]) {
-              const payload = events[Events.LABELS_EDIT];
-              this.labelHandle[Events.LABELS_EDIT](payload);
-              return;
-            }
-          }
-        } catch (error) {
-          this.logger.error(error);
-        }
-      });
+      this.eventQueue.enqueue(
+        Object.keys(events),
+        (ctx) => this.processEvents(events as EventMap, generation, ctx),
+        entryId,
+      );
     });
+  }
+
+  /**
+   * Processes one event batch, live (generation = the socket it came from) or replayed from Redis (generation = null).
+   *
+   * Socket-lifecycle events (call, connection.update, creds.update, presence.update) are only acted on while their
+   * socket is still current: a late `close` from a replaced socket must never trigger a reconnect. Data events are
+   * always processed: WhatsApp already considers them delivered and will not send them again.
+   *
+   * Each handler runs as its own step: the step name is what a queue timeout reports, and one failing handler no
+   * longer skips the rest of the batch.
+   */
+  private async processEvents(events: EventMap, generation: number | null, ctx: QueueItemContext) {
+    if (this.endSession) {
+      return;
+    }
+
+    const step = async (name: string, run: () => unknown) => {
+      ctx.step = name;
+      try {
+        await run();
+      } catch (error) {
+        this.logger.error({ localError: `event handler ${name}`, error: error?.message ?? error, stack: error?.stack });
+      }
+    };
+
+    const isLive = generation !== null;
+    const socketCurrent = isLive && generation === this.clientGeneration;
+    const database = this.configService.get<Database>('DATABASE');
+
+    let settings: any;
+    ctx.step = 'findSettings';
+    try {
+      settings = await this.findSettings();
+    } catch (error) {
+      this.logger.error({ localError: 'event handler findSettings', error: error?.message ?? error });
+    }
+
+    if (socketCurrent) {
+      if (events.call) {
+        await step('call', async () => {
+          const call = events.call[0];
+
+          if (settings?.rejectCall && call.status == 'offer') {
+            this.client.rejectCall(call.id, call.from);
+          }
+
+          if (settings?.msgCall?.trim().length > 0 && call.status == 'offer') {
+            if (call.from.endsWith('@lid')) {
+              call.from = await this.client.signalRepository.lidMapping.getPNForLID(call.from as string);
+            }
+            const msg = await this.client.sendMessage(call.from, { text: settings.msgCall });
+
+            this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
+          }
+
+          this.sendDataWebhook(Events.CALL, call);
+        });
+      }
+
+      if (events['connection.update']) {
+        ctx.step = 'connection.update';
+        // Not awaited, as before: it can wait on reconnect bookkeeping that must not hold the queue.
+        this.connectionUpdate(events['connection.update'], generation).catch((error) =>
+          this.logger.error({ localError: 'connection.update', error: error?.message ?? error }),
+        );
+      }
+
+      if (events['creds.update']) {
+        ctx.step = 'creds.update';
+        Promise.resolve(this.instance.authState.saveCreds()).catch((error) =>
+          this.logger.error({ localError: 'creds.update', error: error?.message ?? error }),
+        );
+      }
+
+      if (events['presence.update']) {
+        const payload = events['presence.update'];
+
+        if (!(settings?.groupsIgnore && payload.id.includes('@g.us'))) {
+          this.sendDataWebhook(Events.PRESENCE_UPDATE, payload);
+        }
+      }
+    }
+
+    if (events['messaging-history.set']) {
+      await step('messaging-history.set', () =>
+        this.messageHandle['messaging-history.set'](events['messaging-history.set']),
+      );
+    }
+
+    if (events['messages.upsert']) {
+      await step('messages.upsert', () => this.messageHandle['messages.upsert'](events['messages.upsert'], settings));
+    }
+
+    if (events['messages.update']) {
+      await step('messages.update', () => this.messageHandle['messages.update'](events['messages.update'], settings));
+    }
+
+    if (events['message-receipt.update']) {
+      await step('message-receipt.update', async () => {
+        const payload = events['message-receipt.update'] as MessageUserReceiptUpdate[];
+        const remotesJidMap: Record<string, number> = {};
+
+        for (const event of payload) {
+          if (typeof event.key.remoteJid === 'string' && typeof event.receipt.readTimestamp === 'number') {
+            remotesJidMap[event.key.remoteJid] = event.receipt.readTimestamp;
+          }
+        }
+
+        await Promise.all(
+          Object.keys(remotesJidMap).map(async (remoteJid) =>
+            this.updateMessagesReadedByTimestamp(remoteJid, remotesJidMap[remoteJid]),
+          ),
+        );
+      });
+    }
+
+    if (!settings?.groupsIgnore) {
+      if (events['groups.upsert']) {
+        await step('groups.upsert', () => this.groupHandler['groups.upsert'](events['groups.upsert']));
+      }
+
+      if (events['groups.update']) {
+        await step('groups.update', () => this.groupHandler['groups.update'](events['groups.update']));
+      }
+
+      if (events['group-participants.update']) {
+        await step('group-participants.update', () =>
+          this.groupHandler['group-participants.update'](events['group-participants.update'] as any),
+        );
+      }
+    }
+
+    if (events['chats.upsert']) {
+      await step('chats.upsert', () => this.chatHandle['chats.upsert'](events['chats.upsert']));
+    }
+
+    if (events['chats.update']) {
+      await step('chats.update', () => this.chatHandle['chats.update'](events['chats.update']));
+    }
+
+    if (events['chats.delete']) {
+      await step('chats.delete', () => this.chatHandle['chats.delete'](events['chats.delete']));
+    }
+
+    if (events['contacts.upsert']) {
+      await step('contacts.upsert', () => this.contactHandle['contacts.upsert'](events['contacts.upsert']));
+    }
+
+    if (events['contacts.update']) {
+      await step('contacts.update', () => this.contactHandle['contacts.update'](events['contacts.update']));
+    }
+
+    if (events[Events.LABELS_ASSOCIATION]) {
+      await step(Events.LABELS_ASSOCIATION, () =>
+        this.labelHandle[Events.LABELS_ASSOCIATION](events[Events.LABELS_ASSOCIATION], database),
+      );
+    }
+
+    if (events[Events.LABELS_EDIT]) {
+      await step(Events.LABELS_EDIT, () => this.labelHandle[Events.LABELS_EDIT](events[Events.LABELS_EDIT]));
+    }
+
+    ctx.step = undefined;
   }
 
   private historySyncNotification(msg: proto.Message.IHistorySyncNotification) {

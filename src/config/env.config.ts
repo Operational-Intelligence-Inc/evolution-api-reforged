@@ -336,6 +336,16 @@ export type CacheConfRedis = {
   TTL: number;
   SAVE_INSTANCES: boolean;
 };
+/**
+ * Per-instance Baileys event queue (see #50): data events are persisted to a Redis stream on receipt and acked once
+ * processed, so a restart replays what was still queued. Persistence needs CACHE_REDIS_ENABLED.
+ */
+export type EventQueueConf = {
+  PERSIST: boolean;
+  ITEM_TIMEOUT_MS: number;
+  MAX_ENTRY_BYTES: number;
+  MAX_LENGTH: number;
+};
 export type CacheConfLocal = {
   ENABLED: boolean;
   TTL: number;
@@ -466,6 +476,7 @@ export interface Env {
   EVOAI: Evoai;
   FLOWISE: Flowise;
   CACHE: CacheConf;
+  EVENT_QUEUE: EventQueueConf;
   S3?: S3;
   AUTHENTICATION: Auth;
   METRICS: Metrics;
@@ -903,6 +914,12 @@ export class ConfigService {
           ENABLED: process.env?.CACHE_LOCAL_ENABLED === 'true',
           TTL: Number.parseInt(process.env?.CACHE_REDIS_TTL) || 86400,
         },
+      },
+      EVENT_QUEUE: {
+        PERSIST: process.env?.EVENT_QUEUE_PERSIST !== 'false',
+        ITEM_TIMEOUT_MS: Number.parseInt(process.env?.EVENT_QUEUE_ITEM_TIMEOUT_MS) || 120_000,
+        MAX_ENTRY_BYTES: Number.parseInt(process.env?.EVENT_QUEUE_MAX_ENTRY_BYTES) || 8 * 1024 * 1024,
+        MAX_LENGTH: Number.parseInt(process.env?.EVENT_QUEUE_MAX_LENGTH) || 10_000,
       },
       S3: {
         ACCESS_KEY: process.env?.S3_ACCESS_KEY,
