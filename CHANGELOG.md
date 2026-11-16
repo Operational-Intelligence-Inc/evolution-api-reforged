@@ -1,3 +1,17 @@
+# 3.1.0 (2026-11-15)
+
+### Features
+
+* **Durable Baileys event queue** (#58, closes #50): incoming data events (messages, receipts, chats, contacts, groups, labels) are written to a per-instance Redis stream before processing and removed once processed, so restarting Evolution replays the backlog instead of losing it. Needs `CACHE_REDIS_ENABLED=true`; without Redis, events are processed in memory only. Redis must persist (AOF or RDB) for the backlog to survive a Redis restart.
+  * New settings: `EVENT_QUEUE_PERSIST` (default `true`), `EVENT_QUEUE_ITEM_TIMEOUT_MS` (default `120000`; a slower item is logged and the queue moves on), `EVENT_QUEUE_MAX_ENTRY_BYTES` (default 8 MiB; larger events are processed but not persisted), `EVENT_QUEUE_MAX_LENGTH` (default `10000` entries per instance).
+  * `GET /instance/connectionState/{instance}` returns a `queue` object with queue lag for Baileys instances, since a stalled queue still reads `open`.
+  * Queued events are cleared on logout and on instance deletion.
+  * Replayed events can re-trigger webhooks and chatbot integrations.
+
+### Fixed
+
+* **Reconnect limits** (#57, closes #56): an unscanned pairing stops retrying at `QRCODE_LIMIT`, and consecutive 440 (connection replaced) closes stop at the new `RECONNECT_CONFLICT_LIMIT` (default `10`, `0` = unlimited). The session is kept after a conflict stop, so `GET /instance/connect` or a restart resumes it. QR counts persist across internal retries and reset on a manual connect or successful open.
+
 # 3.0.1 (2026-11-15)
 
 ### Security
