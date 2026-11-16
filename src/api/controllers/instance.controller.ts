@@ -383,10 +383,14 @@ export class InstanceController {
   }
 
   public async connectionState({ instanceName }: InstanceDto) {
+    const instance = this.waMonitor.waInstances[instanceName];
+
     return {
       instance: {
         instanceName: instanceName,
-        state: this.waMonitor.waInstances[instanceName]?.connectionStatus?.state,
+        state: instance?.connectionStatus?.state,
+        // Event queue lag (Baileys only, see #50): an instance whose queue is stalled still reads 'open'.
+        ...(typeof instance?.eventQueueHealth === 'function' ? { queue: instance.eventQueueHealth() } : {}),
       },
     };
   }

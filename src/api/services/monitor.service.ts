@@ -422,6 +422,9 @@ export class WAMonitoringService {
         // A removed instance must not keep a scheduled reconnect alive.
         this.waInstances[instanceName]?.stopReconnecting?.();
 
+        // Nor leave persisted events behind (see #50); logout already clears them when the instance was connected.
+        await this.waInstances[instanceName]?.clearEventQueue?.();
+
         await this.waInstances[instanceName]?.sendDataWebhook(Events.REMOVE_INSTANCE, null);
 
         this.clearDelInstanceTime(instanceName);
