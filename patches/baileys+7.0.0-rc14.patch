@@ -15,7 +15,7 @@ diff --git a/node_modules/baileys/lib/Utils/validate-connection.js b/node_module
          requireFullSync: config.syncFullHistory,
          historySyncConfig: {
 +            // Evolution fork: ask for up to ten years when full history is requested. Unset, the phone
-+            // appears to choose about one year for linked devices (experimental, see PR #65).
++            // sends about one year to linked devices (see PR #65).
 +            fullSyncDaysLimit: config.syncFullHistory ? 3650 : undefined,
              storageQuotaMb: 10240,
              inlineInitialPayloadInE2EeMsg: true,
