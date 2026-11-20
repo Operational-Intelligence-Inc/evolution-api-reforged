@@ -1480,8 +1480,11 @@ export class BaileysStartupService extends ChannelStartupService {
           chatwootImport.setRepositoryMessagesCache(instance, messagesRepository);
         }
 
+        const skipped = { incomplete: 0, outOfRange: 0, known: 0 };
+
         for (const m of messages) {
           if (!m.message || !m.key || !m.messageTimestamp) {
+            skipped.incomplete++;
             continue;
           }
 
@@ -1491,11 +1494,13 @@ export class BaileysStartupService extends ChannelStartupService {
 
           if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
             if (m.messageTimestamp <= timestampLimitToImport) {
+              skipped.outOfRange++;
               continue;
             }
           }
 
           if (messagesRepository?.has(m.key.id)) {
+            skipped.known++;
             continue;
           }
           // Remember it, so a later batch (or a repeat within this batch) doesn't queue it again.
@@ -1519,7 +1524,16 @@ export class BaileysStartupService extends ChannelStartupService {
         });
 
         if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
-          await this.prismaRepository.message.createMany({ data: messagesRaw, skipDuplicates: true });
+          const stored = await this.insertHistoryMessages(messagesRaw);
+          this.logger.info(
+            `history batch stored: type=${syncType} inserted=${stored.inserted} failed=${stored.failed}` +
+              ` skippedKnown=${skipped.known} skippedIncomplete=${skipped.incomplete} skippedOutOfRange=${skipped.outOfRange}` +
+              (stored.firstError ? ` firstError=${stored.firstError}` : ''),
+          );
+          // Forget ids that never reached the table, so a later batch or re-import can still store them.
+          for (const id of stored.failedIds) {
+            messagesRepository?.delete(id);
+          }
           await this.applyWhatsAppUnreadCounts(await this.historyUnreadTargets(historyUnreadCounts, messagesRaw));
         }
 
@@ -2494,6 +2508,53 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     ctx.step = undefined;
+  }
+
+  /**
+   * Stores a history batch without letting one bad row drop the rest. createMany is one statement, so a single row
+   * Postgres refuses (a NUL character in jsonb, for one) used to fail the whole batch, logged only at ERROR. On failure
+   * the batch is retried in chunks, and a failing chunk row by row; rows that still fail are counted, not thrown.
+   */
+  private async insertHistoryMessages(rows: any[]) {
+    const result = { inserted: 0, failed: 0, failedIds: [] as string[], firstError: undefined as string | undefined };
+    const describe = (error: any) =>
+      String(error?.code ?? error?.meta?.code ?? error?.name ?? 'error') +
+      ':' +
+      String(error?.meta?.message ?? error?.message ?? '')
+        .replace(/\s+/g, ' ')
+        .slice(0, 200);
+
+    const insert = async (data: any[]) =>
+      (await this.prismaRepository.message.createMany({ data, skipDuplicates: true })).count;
+
+    try {
+      result.inserted = await insert(rows);
+      return result;
+    } catch (error) {
+      result.firstError = describe(error);
+    }
+
+    const CHUNK = 250;
+    for (let i = 0; i < rows.length; i += CHUNK) {
+      const chunk = rows.slice(i, i + CHUNK);
+      try {
+        result.inserted += await insert(chunk);
+        continue;
+      } catch {
+        // fall through to one row at a time
+      }
+      for (const row of chunk) {
+        try {
+          result.inserted += await insert([row]);
+        } catch (error) {
+          result.failed++;
+          if (row?.key?.id) result.failedIds.push(row.key.id);
+          result.firstError ??= describe(error);
+        }
+      }
+    }
+
+    return result;
   }
 
   private historySyncNotification(msg: proto.Message.IHistorySyncNotification) {
