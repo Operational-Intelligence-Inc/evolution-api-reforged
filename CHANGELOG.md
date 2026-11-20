@@ -1,3 +1,13 @@
+# Unreleased
+
+### Features
+
+* **Desktop identity for full history** (closes #64): an instance with `syncFullHistory: true` now pairs as a Windows Desktop client (`['Windows', 'Desktop', '10.0.22631']`, web sub-platform `WIN_HYBRID`) instead of a browser. WhatsApp only sends a browser client (`WEB_BROWSER`) about a year of history, and a Desktop sub-platform is the only way to ask for more. Applies to QR and pairing-code pairings.
+  * Baileys `7.0.0-rc14` is patched (`patches/`, applied by `patch-package` on install) to advertise Windows as `WIN_HYBRID` instead of `WIN32`, which WhatsApp rejects with 428 before the QR (WhiskeySockets/Baileys#2741). Remove the patch once a Baileys release includes that change.
+  * The identity is chosen at pairing and kept for the life of the session. Sessions paired before this change keep their browser identity until they are logged out and paired again. Turning `syncFullHistory` on for an already-paired instance changes nothing until it is re-paired.
+  * Under Linked Devices on the phone, a full-history instance shows as a Windows device instead of `CONFIG_SESSION_PHONE_CLIENT` ("Evolution API").
+  * Instances with `syncFullHistory: false` are unchanged.
+
 # 3.1.0 (2026-11-15)
 
 ### Features

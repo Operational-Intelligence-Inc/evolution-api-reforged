@@ -97,6 +97,7 @@ import { useMultiFileAuthStateRedisDb } from '@utils/use-multi-file-auth-state-r
 import axios from 'axios';
 import makeWASocket, {
   AnyMessageContent,
+  AuthenticationCreds,
   BinaryNode,
   BufferedEventData,
   BufferJSON,
@@ -161,6 +162,7 @@ import { v4 } from 'uuid';
 
 import { BaileysEventQueue, EventMap, QueueItemContext } from './baileys-event-queue';
 import { BaileysMessageProcessor } from './baileysMessage.processor';
+import { chooseBrowserIdentity, CREDS_IDENTITY_KEY, DESKTOP_IDENTITY } from './browser.identity';
 import { decideOnClose, nextConflictCount, reconnectDelayMs, STABLE_CONNECTION_MS } from './reconnect.policy';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 
@@ -815,17 +817,39 @@ export class BaileysStartupService extends ChannelStartupService {
 
     const session = this.configService.get<ConfigSessionPhone>('CONFIG_SESSION_PHONE');
 
-    let browserOptions = {};
+    const pairingCode = Boolean(number || this.phoneNumber);
 
-    if (number || this.phoneNumber) {
+    if (pairingCode) {
       this.phoneNumber = number;
 
       this.logger.info(`Phone number: ${number}`);
-    } else {
-      const browser: WABrowserDescription = [session.CLIENT, session.NAME, release()];
-      browserOptions = { browser };
+    }
 
-      this.logger.info(`Browser: ${browser}`);
+    const creds = this.instance.authState.state.creds as AuthenticationCreds & Record<string, unknown>;
+    const paired = Boolean(creds?.me?.id);
+    const identity = chooseBrowserIdentity({
+      paired,
+      storedIdentity: creds?.[CREDS_IDENTITY_KEY],
+      syncFullHistory: this.localSettings.syncFullHistory === true,
+      pairingCode,
+      configuredClient: session.CLIENT,
+      configuredName: session.NAME,
+      osRelease: release(),
+    });
+
+    if (!paired && creds) {
+      // Remembered with the creds once pairing saves them, so later logins keep the identity this device paired with.
+      if (identity.desktop) {
+        creds[CREDS_IDENTITY_KEY] = DESKTOP_IDENTITY;
+      } else {
+        delete creds[CREDS_IDENTITY_KEY];
+      }
+    }
+
+    const browserOptions: { browser?: WABrowserDescription } = identity.browser ? { browser: identity.browser } : {};
+
+    if (identity.browser) {
+      this.logger.info(`Browser: ${identity.browser}${identity.desktop ? ' (Desktop identity for full history)' : ''}`);
     }
 
     const baileysVersion = await fetchLatestWaWebVersion({});
@@ -905,7 +929,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
         return isGroupJid || isBroadcast || isNewsletter;
       },
-      syncFullHistory: this.localSettings.syncFullHistory,
+      syncFullHistory: identity.baileysSyncFullHistory,
       shouldSyncHistoryMessage: (msg: proto.Message.IHistorySyncNotification) => {
         return this.historySyncNotification(msg);
       },
