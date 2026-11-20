@@ -98,3 +98,24 @@ describe('patched Baileys client payload', () => {
     assert.equal(webSubPlatform, WebSubPlatform.WEB_BROWSER);
   });
 });
+
+describe('patched Baileys registration payload', () => {
+  // generateRegistrationNode is what a QR pairing sends; its DeviceProps carry the history sync request.
+  const historySyncConfig = async (syncFullHistory: boolean) => {
+    const { generateRegistrationNode, proto } = await import('baileys');
+    const key = { public: Buffer.alloc(32), private: Buffer.alloc(32) };
+    const payload = generateRegistrationNode(
+      { registrationId: 1, signedPreKey: { keyId: 1, keyPair: key, signature: Buffer.alloc(64) }, signedIdentityKey: key } as any,
+      { browser: ['Windows', 'Desktop', '10.0.22631'], syncFullHistory, version: [2, 3000, 0], countryCode: 'US' } as any,
+    );
+    return proto.DeviceProps.decode(payload.devicePairingData!.deviceProps!).historySyncConfig!;
+  };
+
+  it('asks for ten years of history when full history is on', async () => {
+    assert.equal((await historySyncConfig(true)).fullSyncDaysLimit, 3650);
+  });
+
+  it('leaves the history window to WhatsApp when full history is off', async () => {
+    assert.equal((await historySyncConfig(false)).fullSyncDaysLimit ?? undefined, undefined);
+  });
+});
