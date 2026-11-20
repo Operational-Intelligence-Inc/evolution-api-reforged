@@ -1,0 +1,23 @@
+diff --git a/node_modules/baileys/lib/Utils/validate-connection.js b/node_modules/baileys/lib/Utils/validate-connection.js
+--- a/node_modules/baileys/lib/Utils/validate-connection.js
++++ b/node_modules/baileys/lib/Utils/validate-connection.js
+@@ -28,7 +28,7 @@
+ };
+ const PLATFORM_MAP = {
+     'Mac OS': proto.ClientPayload.WebInfo.WebSubPlatform.DARWIN,
+-    Windows: proto.ClientPayload.WebInfo.WebSubPlatform.WIN32
++    Windows: proto.ClientPayload.WebInfo.WebSubPlatform.WIN_HYBRID
+ };
+ const getWebInfo = (config) => {
+     let webSubPlatform = proto.ClientPayload.WebInfo.WebSubPlatform.WEB_BROWSER;
+@@ -85,6 +85,10 @@
+         platformType: getPlatformType(config.browser[1]),
+         requireFullSync: config.syncFullHistory,
+         historySyncConfig: {
++            // Evolution fork: ask for up to ten years and 10 GB when full history is requested. Unset, the phone
++            // sends about one year to linked devices (see PR #65).
++            fullSyncDaysLimit: config.syncFullHistory ? 3650 : undefined,
++            fullSyncSizeMbLimit: config.syncFullHistory ? 10240 : undefined,
+             storageQuotaMb: 10240,
+             inlineInitialPayloadInE2EeMsg: true,
+             recentSyncDaysLimit: undefined,
