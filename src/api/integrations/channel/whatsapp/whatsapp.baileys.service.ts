@@ -1381,8 +1381,14 @@ export class BaileysStartupService extends ChannelStartupService {
                 : ''),
           );
         }
-        this.logger.verbose(
-          `recv ${chats.length} chats, ${contacts.length} contacts, ${messages.length} msgs (is latest: ${isLatest}, progress: ${progress}%), type: ${syncType}`,
+        // One INFO line per batch, counts and dates only, so the reach of an import can be read from the logs.
+        const batchStamps = messages.map((message) => Number(message.messageTimestamp)).filter((t) => t > 0);
+        this.logger.info(
+          `history batch: type=${syncType} msgs=${messages.length} chats=${chats.length} contacts=${contacts.length}` +
+            ` progress=${progress ?? 'n/a'} isLatest=${isLatest}` +
+            (batchStamps.length
+              ? ` from=${new Date(Math.min(...batchStamps) * 1000).toISOString()} to=${new Date(Math.max(...batchStamps) * 1000).toISOString()}`
+              : ''),
         );
 
         const instance: InstanceDto = { instanceName: this.instance.name };

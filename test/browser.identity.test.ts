@@ -111,11 +111,15 @@ describe('patched Baileys registration payload', () => {
     return proto.DeviceProps.decode(payload.devicePairingData!.deviceProps!).historySyncConfig!;
   };
 
-  it('asks for ten years of history when full history is on', async () => {
-    assert.equal((await historySyncConfig(true)).fullSyncDaysLimit, 3650);
+  it('asks for ten years and 10 GB of history when full history is on', async () => {
+    const config = await historySyncConfig(true);
+    assert.equal(config.fullSyncDaysLimit, 3650);
+    assert.equal(config.fullSyncSizeMbLimit, 10240);
   });
 
   it('leaves the history window to WhatsApp when full history is off', async () => {
-    assert.equal((await historySyncConfig(false)).fullSyncDaysLimit ?? undefined, undefined);
+    const config = await historySyncConfig(false);
+    assert.equal(config.fullSyncDaysLimit ?? undefined, undefined);
+    assert.equal(config.fullSyncSizeMbLimit ?? undefined, undefined);
   });
 });
