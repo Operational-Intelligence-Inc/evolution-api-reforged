@@ -2,7 +2,6 @@ import {
   ArchiveChatDto,
   BlockUserDto,
   DeleteMessage,
-  FetchHistoryDto,
   getBase64FromMediaMessageDto,
   LidMappingDto,
   MarkChatUnreadDto,
@@ -26,10 +25,6 @@ export class ChatController {
 
   public async lidMapping({ instanceName }: InstanceDto, data: LidMappingDto) {
     return await this.waMonitor.waInstances[instanceName].getLidMapping(data);
-  }
-
-  public async fetchHistory({ instanceName }: InstanceDto, data: FetchHistoryDto) {
-    return await this.waMonitor.waInstances[instanceName].fetchHistory(data);
   }
 
   public async whatsappNumber({ instanceName }: InstanceDto, data: WhatsAppNumberDto) {

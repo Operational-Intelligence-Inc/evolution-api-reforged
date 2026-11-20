@@ -1,9 +1,10 @@
 /**
  * Which browser identity a Baileys socket advertises to WhatsApp (see #64).
  *
- * WhatsApp sizes the history it sends a new device by the device's web sub-platform. A browser client
- * (WEB_BROWSER) gets about a year. Baileys only asks for more when `syncFullHistory` is on and the browser tuple is
- * `['Windows' | 'Mac OS', 'Desktop', ...]`. Baileys rc14 maps Windows to WIN32, which WhatsApp has rejected with 428
+ * Baileys recommends a Desktop identity for full history: it advertises a Desktop web sub-platform only when
+ * `syncFullHistory` is on and the browser tuple is `['Windows' | 'Mac OS', 'Desktop', ...]`. In a live test the identity
+ * alone did not lengthen the import; the history window comes from `historySyncConfig.fullSyncDaysLimit`, which the
+ * same patch sets (see #65). Baileys rc14 maps Windows to WIN32, which WhatsApp has rejected with 428
  * before the QR since about 2026-06-30, so the dependency is patched to WIN_HYBRID (patches/baileys+*.patch,
  * WhiskeySockets/Baileys#2741). 'Mac OS' (DARWIN) still gets 428 and is never used.
  *

@@ -2,15 +2,21 @@
 
 ### Features
 
-* **Desktop identity for full history** (closes #64): an instance with `syncFullHistory: true` now pairs as a Windows Desktop client (`['Windows', 'Desktop', '10.0.22631']`, web sub-platform `WIN_HYBRID`) instead of a browser. WhatsApp only sends a browser client (`WEB_BROWSER`) about a year of history, and a Desktop sub-platform is the only way to ask for more. Applies to QR and pairing-code pairings.
-  * Baileys `7.0.0-rc14` is patched (`patches/`, applied by `patch-package` on install) to advertise Windows as `WIN_HYBRID` instead of `WIN32`, which WhatsApp rejects with 428 before the QR (WhiskeySockets/Baileys#2741). Remove the patch once a Baileys release includes that change.
-  * The identity is chosen at pairing and kept for the life of the session. Sessions paired before this change keep their browser identity until they are logged out and paired again. Turning `syncFullHistory` on for an already-paired instance changes nothing until it is re-paired.
+* **Full history beyond one year** (closes #64): an instance with `syncFullHistory: true` now asks WhatsApp for all of the phone's history. Before, the import stopped at exactly one year.
+  * The pairing asks for up to ten years and 10 GB (`historySyncConfig.fullSyncDaysLimit: 3650`, `fullSyncSizeMbLimit: 10240`). Baileys leaves both unset, and the phone then sends one year. The day limit is what moves the edge. In a live test, the import then reached the start of the phone's own history, 16 months back. The size limit is a safeguard that hasn't been tested on its own.
+  * The instance also pairs as a Windows Desktop client (`['Windows', 'Desktop', '10.0.22631']`, web sub-platform `WIN_HYBRID`) instead of a browser, as Baileys recommends for full history. This applies to QR and pairing-code pairings. On its own, the Desktop identity still got one year.
+  * Baileys `7.0.0-rc14` is patched (`patches/`, applied by `patch-package` on install) to set those limits and to advertise Windows as `WIN_HYBRID` instead of `WIN32`. WhatsApp rejects `WIN32` with 428 before the QR (WhiskeySockets/Baileys#2741). Drop that part of the patch once a Baileys release includes the change.
+  * The identity is chosen at pairing and kept for the life of the session. History only arrives at pairing, so an existing instance gets the longer history only after it is logged out and paired again. Turning `syncFullHistory` on for a paired instance changes nothing until then.
   * Under Linked Devices on the phone, a full-history instance shows as a Windows device instead of `CONFIG_SESSION_PHONE_CLIENT` ("Evolution API").
-  * A full-history pairing also asks for ten years and 10 GB of history (`historySyncConfig.fullSyncDaysLimit: 3650`, `fullSyncSizeMbLimit: 10240`, set in the patched Baileys). Baileys leaves both unset, and the phone then sends about one year. In a live test, the Desktop identity alone still stopped at exactly one year. Adding the day limit took the same account back about 16 months, to a sharp edge. The size limit is there to test whether that edge is a size cap.
-* **History import no longer drops a whole batch over one bad row.** A batch was stored with one `createMany`, so a single row Postgres refused failed all of it, and the error was logged only at ERROR. The batch is now retried in chunks and then row by row; rows that still fail are counted and skipped. Rows that arrive without content are summarised at INFO as `history batch incomplete rows:` (field names, stub type and three sample keys, never content). Each batch logs `history batch stored: inserted=… failed=… skippedKnown=… skippedIncomplete=… skippedOutOfRange=… firstError=…` at INFO (no content).
-* Each history batch is logged at INFO (`history batch: type=… msgs=… progress=… isLatest=… from=… to=…`), counts and dates only, replacing the VERBOSE `recv …` line, so an import's reach and completion can be read from production logs.
   * Instances with `syncFullHistory: false` are unchanged.
-* **Experimental: `POST /chat/fetchHistory/{instance}`** with `{ "remoteJid": "...", "count": 50, "anchor"?: { "id", "fromMe"?, "participant"?, "timestamp" } }` asks the phone for up to `count` (1–50) messages older than the oldest one stored for that chat, the request WhatsApp Web sends from its "get older messages from your phone" button. Answers with the request id; any reply arrives later as an `ON_DEMAND` history sync and is stored like the pairing import. Whether WhatsApp answers a linked Baileys device is unconfirmed (WhiskeySockets/Baileys#2452). Requests and replies are logged at INFO (`on-demand history requested/notification/received`, ids and dates only).
+* **Each history batch is logged at INFO**, counts and dates only. This replaces the VERBOSE `recv …` line, so an import's reach and completion can be read from production logs. Two lines per batch:
+  * `history batch: type=… msgs=… progress=… isLatest=… from=… to=…` when the batch arrives.
+  * `history batch stored: inserted=… failed=… skippedKnown=… skippedIncomplete=… skippedOutOfRange=…` once it is written.
+  * Rows skipped as incomplete are WhatsApp system events with no content, such as the encryption notice or "X created the group". Their dates can reach back years before the oldest real message.
+
+### Fixed
+
+* **One bad row no longer drops a whole history batch.** A batch was written with a single `createMany`, so one row Postgres refused failed all of it, and the error was logged only at ERROR. A failed batch is now retried in chunks and then row by row. Rows that still fail are counted, reported as `firstError`, and left out of the "already stored" set, so a later import can store them.
 
 # 3.1.0 (2026-11-15)
 

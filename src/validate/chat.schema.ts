@@ -51,26 +51,6 @@ export const lidMappingSchema: JSONSchema7 = {
   anyOf: [{ required: ['lids'] }, { required: ['pns'] }],
 };
 
-export const fetchHistorySchema: JSONSchema7 = {
-  $id: v4(),
-  type: 'object',
-  properties: {
-    remoteJid: { type: 'string', minLength: 1 },
-    count: { type: 'integer', minimum: 1, maximum: 50 },
-    anchor: {
-      type: 'object',
-      properties: {
-        id: { type: 'string', minLength: 1 },
-        fromMe: { type: 'boolean' },
-        participant: { type: 'string' },
-        timestamp: { type: 'integer', minimum: 1 },
-      },
-      required: ['id', 'timestamp'],
-    },
-  },
-  required: ['remoteJid'],
-};
-
 export const readMessageSchema: JSONSchema7 = {
   $id: v4(),
   type: 'object',

@@ -4,7 +4,6 @@ import {
   ArchiveChatDto,
   BlockUserDto,
   DeleteMessage,
-  FetchHistoryDto,
   getBase64FromMediaMessageDto,
   LastMessage,
   LidMappingDto,
@@ -1361,7 +1360,6 @@ export class BaileysStartupService extends ChannelStartupService {
       isLatest,
       progress,
       syncType,
-      peerDataRequestSessionId,
     }: {
       chats: Chat[];
       contacts: Contact[];
@@ -1369,17 +1367,10 @@ export class BaileysStartupService extends ChannelStartupService {
       isLatest?: boolean;
       progress?: number;
       syncType?: proto.HistorySync.HistorySyncType;
-      peerDataRequestSessionId?: string | null;
     }) => {
       try {
         if (syncType === proto.HistorySync.HistorySyncType.ON_DEMAND) {
-          const stamps = messages.map((message) => Number(message.messageTimestamp)).filter((t) => t > 0);
-          this.logger.info(
-            `on-demand history received: id=${peerDataRequestSessionId ?? 'none'} msgs=${messages.length}` +
-              (stamps.length
-                ? ` from=${new Date(Math.min(...stamps) * 1000).toISOString()} to=${new Date(Math.max(...stamps) * 1000).toISOString()}`
-                : ''),
-          );
+          this.logger.verbose({ event: 'received on-demand history sync', messages });
         }
         // One INFO line per batch, counts and dates only, so the reach of an import can be read from the logs.
         const batchStamps = messages.map((message) => Number(message.messageTimestamp)).filter((t) => t > 0);
@@ -1482,34 +1473,9 @@ export class BaileysStartupService extends ChannelStartupService {
 
         const skipped = { incomplete: 0, outOfRange: 0, known: 0 };
 
-        // Shape of rows skipped for having no content: which fields are set, never their values (see PR #65).
-        const incompleteShapes = new Map<string, number>();
-        const incompleteSamples: string[] = [];
-
         for (const m of messages) {
           if (!m.message || !m.key || !m.messageTimestamp) {
             skipped.incomplete++;
-            const fields = Object.keys(m)
-              .filter((field) => m[field] !== null && m[field] !== undefined)
-              .sort()
-              .join(',');
-            const shape = `stub=${m.messageStubType ?? '-'} fields=${fields}`;
-            incompleteShapes.set(shape, (incompleteShapes.get(shape) ?? 0) + 1);
-            if (incompleteSamples.length < 3) {
-              const ts = Long.isLong(m.messageTimestamp) ? m.messageTimestamp.toNumber() : Number(m.messageTimestamp);
-              incompleteSamples.push(
-                JSON.stringify({
-                  remoteJid: m.key?.remoteJid,
-                  id: m.key?.id,
-                  fromMe: m.key?.fromMe,
-                  participant: m.key?.participant,
-                  at: ts > 0 ? new Date(ts * 1000).toISOString() : null,
-                  stub: m.messageStubType ?? null,
-                  stubParams: m.messageStubParameters?.length ?? 0,
-                  status: m.status ?? null,
-                }),
-              );
-            }
             continue;
           }
 
@@ -1555,17 +1521,6 @@ export class BaileysStartupService extends ChannelStartupService {
               ` skippedKnown=${skipped.known} skippedIncomplete=${skipped.incomplete} skippedOutOfRange=${skipped.outOfRange}` +
               (stored.firstError ? ` firstError=${stored.firstError}` : ''),
           );
-          if (skipped.incomplete > 0) {
-            this.logger.info(
-              `history batch incomplete rows: type=${syncType} n=${skipped.incomplete} shapes=` +
-                [...incompleteShapes.entries()]
-                  .sort((a, b) => b[1] - a[1])
-                  .slice(0, 5)
-                  .map(([shape, n]) => `[${shape} x${n}]`)
-                  .join(' ') +
-                ` samples=${incompleteSamples.join(' ')}`,
-            );
-          }
           // Forget ids that never reached the table, so a later batch or re-import can still store them.
           for (const id of stored.failedIds) {
             messagesRepository?.delete(id);
@@ -2595,10 +2550,6 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private historySyncNotification(msg: proto.Message.IHistorySyncNotification) {
     const instance: InstanceDto = { instanceName: this.instance.name };
-
-    if (msg?.syncType === proto.HistorySync.HistorySyncType.ON_DEMAND) {
-      this.logger.info(`on-demand history notification: id=${msg.peerDataRequestSessionId ?? 'none'}`);
-    }
 
     if (
       this.configService.get<Chatwoot>('CHATWOOT').ENABLED &&
@@ -5021,67 +4972,6 @@ export class BaileysStartupService extends ChannelStartupService {
     return {
       lids: Object.fromEntries(lidInputs.map(([input, jid]) => [input, (jid && pnByLid.get(jid)) || null])),
       pns: Object.fromEntries(pnInputs.map(([input, jid]) => [input, (jid && lidByPn.get(jid)) || null])),
-    };
-  }
-
-  /**
-   * Asks the phone for up to `count` messages older than the oldest one stored for a chat: the request WhatsApp Web
-   * sends from its "get older messages from your phone" button. Experimental: whether WhatsApp answers a
-   * linked Baileys device is unconfirmed (WhiskeySockets/Baileys#2452). The reply, if any, arrives later as an
-   * ON_DEMAND history sync and is stored by the ordinary messaging-history.set handler; this only sends the request.
-   */
-  public async fetchHistory(data: FetchHistoryDto) {
-    const remoteJid = data?.remoteJid;
-    const count = data?.count ?? 50;
-
-    if (!remoteJid) {
-      throw new BadRequestException('Pass "remoteJid"');
-    }
-    if (!Number.isInteger(count) || count < 1 || count > 50) {
-      throw new BadRequestException('"count" must be an integer from 1 to 50');
-    }
-    if (this.stateConnection?.state !== 'open') {
-      throw new BadRequestException(`Instance "${this.instance.name}" is not connected`);
-    }
-
-    // An explicit anchor (a message the phone listed without content) overrides the oldest stored message.
-    const oldest = data.anchor
-      ? {
-          key: {
-            remoteJid,
-            id: data.anchor.id,
-            fromMe: !!data.anchor.fromMe,
-            participant: data.anchor.participant,
-          },
-          messageTimestamp: data.anchor.timestamp,
-        }
-      : await this.prismaRepository.message.findFirst({
-          where: { instanceId: this.instanceId, key: { path: ['remoteJid'], equals: remoteJid } },
-          orderBy: [{ messageTimestamp: 'asc' }],
-          select: { key: true, messageTimestamp: true },
-        });
-    if (!oldest) {
-      throw new NotFoundException(`No stored message for "${remoteJid}" to page back from`);
-    }
-
-    const key = oldest.key as { remoteJid?: string; fromMe?: boolean; id?: string; participant?: string };
-    const timestampMs = Number(oldest.messageTimestamp) * 1000;
-    const requestId = await this.client.fetchMessageHistory(
-      count,
-      { remoteJid: key.remoteJid, fromMe: !!key.fromMe, id: key.id, participant: key.participant },
-      timestampMs,
-    );
-
-    this.logger.info(
-      `on-demand history requested: id=${requestId} count=${count} oldestStored=${new Date(timestampMs).toISOString()}`,
-    );
-
-    return {
-      requestId,
-      remoteJid,
-      count,
-      oldestStoredMessageId: key.id,
-      oldestStoredMessageAt: new Date(timestampMs).toISOString(),
     };
   }
 
