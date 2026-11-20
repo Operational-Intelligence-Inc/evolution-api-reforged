@@ -32,6 +32,12 @@ export class LidMappingDto {
   pns?: string[];
 }
 
+/** POST /chat/fetchHistory: ask the phone for messages older than the oldest one stored for a chat (experimental). */
+export class FetchHistoryDto {
+  remoteJid: string;
+  count?: number;
+}
+
 export class NumberDto {
   number: string;
 }

@@ -7,6 +7,7 @@
   * The identity is chosen at pairing and kept for the life of the session. Sessions paired before this change keep their browser identity until they are logged out and paired again. Turning `syncFullHistory` on for an already-paired instance changes nothing until it is re-paired.
   * Under Linked Devices on the phone, a full-history instance shows as a Windows device instead of `CONFIG_SESSION_PHONE_CLIENT` ("Evolution API").
   * Instances with `syncFullHistory: false` are unchanged.
+* **Experimental: `POST /chat/fetchHistory/{instance}`** with `{ "remoteJid": "...", "count": 50 }` asks the phone for up to `count` (1–50) messages older than the oldest one stored for that chat, the request WhatsApp Web sends from its "get older messages from your phone" button. Answers with the request id; any reply arrives later as an `ON_DEMAND` history sync and is stored like the pairing import. Whether WhatsApp answers a linked Baileys device is unconfirmed (WhiskeySockets/Baileys#2452). Requests and replies are logged at INFO (`on-demand history requested/notification/received`, ids and dates only).
 
 # 3.1.0 (2026-11-15)
 

@@ -3,6 +3,7 @@ import {
   ArchiveChatDto,
   BlockUserDto,
   DeleteMessage,
+  FetchHistoryDto,
   getBase64FromMediaMessageDto,
   LidMappingDto,
   MarkChatUnreadDto,
@@ -26,6 +27,7 @@ import {
   blockUserSchema,
   contactValidateSchema,
   deleteMessageSchema,
+  fetchHistorySchema,
   lidMappingSchema,
   markChatUnreadSchema,
   messageUpSchema,
@@ -57,6 +59,21 @@ export class ChatRouter extends RouterBroker {
             schema: lidMappingSchema,
             ClassRef: LidMappingDto,
             execute: (instance, data) => chatController.lidMapping(instance, data),
+          });
+
+          return res.status(HttpStatus.OK).json(response);
+        } catch (error) {
+          logger.error(error);
+          return res.status(HttpStatus.BAD_REQUEST).json(error);
+        }
+      })
+      .post(this.routerPath('fetchHistory'), ...guards, async (req, res) => {
+        try {
+          const response = await this.dataValidate<FetchHistoryDto>({
+            request: req,
+            schema: fetchHistorySchema,
+            ClassRef: FetchHistoryDto,
+            execute: (instance, data) => chatController.fetchHistory(instance, data),
           });
 
           return res.status(HttpStatus.OK).json(response);

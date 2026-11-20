@@ -4,6 +4,7 @@ import {
   ArchiveChatDto,
   BlockUserDto,
   DeleteMessage,
+  FetchHistoryDto,
   getBase64FromMediaMessageDto,
   LastMessage,
   LidMappingDto,
@@ -1360,6 +1361,7 @@ export class BaileysStartupService extends ChannelStartupService {
       isLatest,
       progress,
       syncType,
+      peerDataRequestSessionId,
     }: {
       chats: Chat[];
       contacts: Contact[];
@@ -1367,10 +1369,17 @@ export class BaileysStartupService extends ChannelStartupService {
       isLatest?: boolean;
       progress?: number;
       syncType?: proto.HistorySync.HistorySyncType;
+      peerDataRequestSessionId?: string | null;
     }) => {
       try {
         if (syncType === proto.HistorySync.HistorySyncType.ON_DEMAND) {
-          this.logger.verbose({ event: 'received on-demand history sync', messages });
+          const stamps = messages.map((message) => Number(message.messageTimestamp)).filter((t) => t > 0);
+          this.logger.info(
+            `on-demand history received: id=${peerDataRequestSessionId ?? 'none'} msgs=${messages.length}` +
+              (stamps.length
+                ? ` from=${new Date(Math.min(...stamps) * 1000).toISOString()} to=${new Date(Math.max(...stamps) * 1000).toISOString()}`
+                : ''),
+          );
         }
         this.logger.verbose(
           `recv ${chats.length} chats, ${contacts.length} contacts, ${messages.length} msgs (is latest: ${isLatest}, progress: ${progress}%), type: ${syncType}`,
@@ -2483,6 +2492,10 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private historySyncNotification(msg: proto.Message.IHistorySyncNotification) {
     const instance: InstanceDto = { instanceName: this.instance.name };
+
+    if (msg?.syncType === proto.HistorySync.HistorySyncType.ON_DEMAND) {
+      this.logger.info(`on-demand history notification: id=${msg.peerDataRequestSessionId ?? 'none'}`);
+    }
 
     if (
       this.configService.get<Chatwoot>('CHATWOOT').ENABLED &&
@@ -4905,6 +4918,56 @@ export class BaileysStartupService extends ChannelStartupService {
     return {
       lids: Object.fromEntries(lidInputs.map(([input, jid]) => [input, (jid && pnByLid.get(jid)) || null])),
       pns: Object.fromEntries(pnInputs.map(([input, jid]) => [input, (jid && lidByPn.get(jid)) || null])),
+    };
+  }
+
+  /**
+   * Asks the phone for up to `count` messages older than the oldest one stored for a chat: the request WhatsApp Web
+   * sends from its "get older messages from your phone" button. Experimental: whether WhatsApp answers a
+   * linked Baileys device is unconfirmed (WhiskeySockets/Baileys#2452). The reply, if any, arrives later as an
+   * ON_DEMAND history sync and is stored by the ordinary messaging-history.set handler; this only sends the request.
+   */
+  public async fetchHistory(data: FetchHistoryDto) {
+    const remoteJid = data?.remoteJid;
+    const count = data?.count ?? 50;
+
+    if (!remoteJid) {
+      throw new BadRequestException('Pass "remoteJid"');
+    }
+    if (!Number.isInteger(count) || count < 1 || count > 50) {
+      throw new BadRequestException('"count" must be an integer from 1 to 50');
+    }
+    if (this.stateConnection?.state !== 'open') {
+      throw new BadRequestException(`Instance "${this.instance.name}" is not connected`);
+    }
+
+    const oldest = await this.prismaRepository.message.findFirst({
+      where: { instanceId: this.instanceId, key: { path: ['remoteJid'], equals: remoteJid } },
+      orderBy: [{ messageTimestamp: 'asc' }],
+      select: { key: true, messageTimestamp: true },
+    });
+    if (!oldest) {
+      throw new NotFoundException(`No stored message for "${remoteJid}" to page back from`);
+    }
+
+    const key = oldest.key as { remoteJid?: string; fromMe?: boolean; id?: string; participant?: string };
+    const timestampMs = Number(oldest.messageTimestamp) * 1000;
+    const requestId = await this.client.fetchMessageHistory(
+      count,
+      { remoteJid: key.remoteJid, fromMe: !!key.fromMe, id: key.id, participant: key.participant },
+      timestampMs,
+    );
+
+    this.logger.info(
+      `on-demand history requested: id=${requestId} count=${count} oldestStored=${new Date(timestampMs).toISOString()}`,
+    );
+
+    return {
+      requestId,
+      remoteJid,
+      count,
+      oldestStoredMessageId: key.id,
+      oldestStoredMessageAt: new Date(timestampMs).toISOString(),
     };
   }
 
