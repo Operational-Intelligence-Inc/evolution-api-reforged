@@ -97,6 +97,7 @@ import { useMultiFileAuthStateRedisDb } from '@utils/use-multi-file-auth-state-r
 import axios from 'axios';
 import makeWASocket, {
   AnyMessageContent,
+  AuthenticationCreds,
   BinaryNode,
   BufferedEventData,
   BufferJSON,
@@ -161,6 +162,7 @@ import { v4 } from 'uuid';
 
 import { BaileysEventQueue, EventMap, QueueItemContext } from './baileys-event-queue';
 import { BaileysMessageProcessor } from './baileysMessage.processor';
+import { chooseBrowserIdentity, CREDS_IDENTITY_KEY, DESKTOP_IDENTITY } from './browser.identity';
 import { decideOnClose, nextConflictCount, reconnectDelayMs, STABLE_CONNECTION_MS } from './reconnect.policy';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 
@@ -815,17 +817,39 @@ export class BaileysStartupService extends ChannelStartupService {
 
     const session = this.configService.get<ConfigSessionPhone>('CONFIG_SESSION_PHONE');
 
-    let browserOptions = {};
+    const pairingCode = Boolean(number || this.phoneNumber);
 
-    if (number || this.phoneNumber) {
+    if (pairingCode) {
       this.phoneNumber = number;
 
       this.logger.info(`Phone number: ${number}`);
-    } else {
-      const browser: WABrowserDescription = [session.CLIENT, session.NAME, release()];
-      browserOptions = { browser };
+    }
 
-      this.logger.info(`Browser: ${browser}`);
+    const creds = this.instance.authState.state.creds as AuthenticationCreds & Record<string, unknown>;
+    const paired = Boolean(creds?.me?.id);
+    const identity = chooseBrowserIdentity({
+      paired,
+      storedIdentity: creds?.[CREDS_IDENTITY_KEY],
+      syncFullHistory: this.localSettings.syncFullHistory === true,
+      pairingCode,
+      configuredClient: session.CLIENT,
+      configuredName: session.NAME,
+      osRelease: release(),
+    });
+
+    if (!paired && creds) {
+      // Remembered with the creds once pairing saves them, so later logins keep the identity this device paired with.
+      if (identity.desktop) {
+        creds[CREDS_IDENTITY_KEY] = DESKTOP_IDENTITY;
+      } else {
+        delete creds[CREDS_IDENTITY_KEY];
+      }
+    }
+
+    const browserOptions: { browser?: WABrowserDescription } = identity.browser ? { browser: identity.browser } : {};
+
+    if (identity.browser) {
+      this.logger.info(`Browser: ${identity.browser}${identity.desktop ? ' (Desktop identity for full history)' : ''}`);
     }
 
     const baileysVersion = await fetchLatestWaWebVersion({});
@@ -905,7 +929,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
         return isGroupJid || isBroadcast || isNewsletter;
       },
-      syncFullHistory: this.localSettings.syncFullHistory,
+      syncFullHistory: identity.baileysSyncFullHistory,
       shouldSyncHistoryMessage: (msg: proto.Message.IHistorySyncNotification) => {
         return this.historySyncNotification(msg);
       },
@@ -1348,8 +1372,14 @@ export class BaileysStartupService extends ChannelStartupService {
         if (syncType === proto.HistorySync.HistorySyncType.ON_DEMAND) {
           this.logger.verbose({ event: 'received on-demand history sync', messages });
         }
-        this.logger.verbose(
-          `recv ${chats.length} chats, ${contacts.length} contacts, ${messages.length} msgs (is latest: ${isLatest}, progress: ${progress}%), type: ${syncType}`,
+        // One INFO line per batch, counts and dates only, so the reach of an import can be read from the logs.
+        const batchStamps = messages.map((message) => Number(message.messageTimestamp)).filter((t) => t > 0);
+        this.logger.info(
+          `history batch: type=${syncType} msgs=${messages.length} chats=${chats.length} contacts=${contacts.length}` +
+            ` progress=${progress ?? 'n/a'} isLatest=${isLatest}` +
+            (batchStamps.length
+              ? ` from=${new Date(Math.min(...batchStamps) * 1000).toISOString()} to=${new Date(Math.max(...batchStamps) * 1000).toISOString()}`
+              : ''),
         );
 
         const instance: InstanceDto = { instanceName: this.instance.name };
@@ -1441,8 +1471,11 @@ export class BaileysStartupService extends ChannelStartupService {
           chatwootImport.setRepositoryMessagesCache(instance, messagesRepository);
         }
 
+        const skipped = { incomplete: 0, outOfRange: 0, known: 0 };
+
         for (const m of messages) {
           if (!m.message || !m.key || !m.messageTimestamp) {
+            skipped.incomplete++;
             continue;
           }
 
@@ -1452,11 +1485,13 @@ export class BaileysStartupService extends ChannelStartupService {
 
           if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
             if (m.messageTimestamp <= timestampLimitToImport) {
+              skipped.outOfRange++;
               continue;
             }
           }
 
           if (messagesRepository?.has(m.key.id)) {
+            skipped.known++;
             continue;
           }
           // Remember it, so a later batch (or a repeat within this batch) doesn't queue it again.
@@ -1480,7 +1515,16 @@ export class BaileysStartupService extends ChannelStartupService {
         });
 
         if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
-          await this.prismaRepository.message.createMany({ data: messagesRaw, skipDuplicates: true });
+          const stored = await this.insertHistoryMessages(messagesRaw);
+          this.logger.info(
+            `history batch stored: type=${syncType} inserted=${stored.inserted} failed=${stored.failed}` +
+              ` skippedKnown=${skipped.known} skippedIncomplete=${skipped.incomplete} skippedOutOfRange=${skipped.outOfRange}` +
+              (stored.firstError ? ` firstError=${stored.firstError}` : ''),
+          );
+          // Forget ids that never reached the table, so a later batch or re-import can still store them.
+          for (const id of stored.failedIds) {
+            messagesRepository?.delete(id);
+          }
           await this.applyWhatsAppUnreadCounts(await this.historyUnreadTargets(historyUnreadCounts, messagesRaw));
         }
 
@@ -2455,6 +2499,53 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     ctx.step = undefined;
+  }
+
+  /**
+   * Stores a history batch without letting one bad row drop the rest. createMany is one statement, so a single row
+   * Postgres refuses (a NUL character in jsonb, for one) used to fail the whole batch, logged only at ERROR. On failure
+   * the batch is retried in chunks, and a failing chunk row by row; rows that still fail are counted, not thrown.
+   */
+  private async insertHistoryMessages(rows: any[]) {
+    const result = { inserted: 0, failed: 0, failedIds: [] as string[], firstError: undefined as string | undefined };
+    const describe = (error: any) =>
+      String(error?.code ?? error?.meta?.code ?? error?.name ?? 'error') +
+      ':' +
+      String(error?.meta?.message ?? error?.message ?? '')
+        .replace(/\s+/g, ' ')
+        .slice(0, 200);
+
+    const insert = async (data: any[]) =>
+      (await this.prismaRepository.message.createMany({ data, skipDuplicates: true })).count;
+
+    try {
+      result.inserted = await insert(rows);
+      return result;
+    } catch (error) {
+      result.firstError = describe(error);
+    }
+
+    const CHUNK = 250;
+    for (let i = 0; i < rows.length; i += CHUNK) {
+      const chunk = rows.slice(i, i + CHUNK);
+      try {
+        result.inserted += await insert(chunk);
+        continue;
+      } catch {
+        // fall through to one row at a time
+      }
+      for (const row of chunk) {
+        try {
+          result.inserted += await insert([row]);
+        } catch (error) {
+          result.failed++;
+          if (row?.key?.id) result.failedIds.push(row.key.id);
+          result.firstError ??= describe(error);
+        }
+      }
+    }
+
+    return result;
   }
 
   private historySyncNotification(msg: proto.Message.IHistorySyncNotification) {

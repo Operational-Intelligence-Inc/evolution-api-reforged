@@ -1,3 +1,23 @@
+# 3.2.0 (2026-11-20)
+
+### Features
+
+* **Full history beyond one year** (closes #64): an instance with `syncFullHistory: true` now asks WhatsApp for all of the phone's history. Before, the import stopped at exactly one year.
+  * The pairing asks for up to ten years and 10 GB (`historySyncConfig.fullSyncDaysLimit: 3650`, `fullSyncSizeMbLimit: 10240`). Baileys leaves both unset, and the phone then sends one year. The day limit is what moves the edge. In a live test, the import then reached the start of the phone's own history, 16 months back. The size limit is a safeguard that hasn't been tested on its own.
+  * The instance also pairs as a Windows Desktop client (`['Windows', 'Desktop', '10.0.22631']`, web sub-platform `WIN_HYBRID`) instead of a browser, as Baileys recommends for full history. This applies to QR and pairing-code pairings. On its own, the Desktop identity still got one year.
+  * Baileys `7.0.0-rc14` is patched (`patches/`, applied by `patch-package` on install) to set those limits and to advertise Windows as `WIN_HYBRID` instead of `WIN32`. WhatsApp rejects `WIN32` with 428 before the QR (WhiskeySockets/Baileys#2741). Drop that part of the patch once a Baileys release includes the change.
+  * The identity is chosen at pairing and kept for the life of the session. History only arrives at pairing, so an existing instance gets the longer history only after it is logged out and paired again. Turning `syncFullHistory` on for a paired instance changes nothing until then.
+  * Under Linked Devices on the phone, a full-history instance shows as a Windows device instead of `CONFIG_SESSION_PHONE_CLIENT` ("Evolution API").
+  * Instances with `syncFullHistory: false` are unchanged.
+* **Each history batch is logged at INFO**, counts and dates only. This replaces the VERBOSE `recv …` line, so an import's reach and completion can be read from production logs. Two lines per batch:
+  * `history batch: type=… msgs=… progress=… isLatest=… from=… to=…` when the batch arrives.
+  * `history batch stored: inserted=… failed=… skippedKnown=… skippedIncomplete=… skippedOutOfRange=…` once it is written.
+  * Rows skipped as incomplete are WhatsApp system events with no content, such as the encryption notice or "X created the group". Their dates can reach back years before the oldest real message.
+
+### Fixed
+
+* **One bad row no longer drops a whole history batch.** A batch was written with a single `createMany`, so one row Postgres refused failed all of it, and the error was logged only at ERROR. A failed batch is now retried in chunks and then row by row. Rows that still fail are counted, reported as `firstError`, and left out of the "already stored" set, so a later import can store them.
+
 # 3.1.0 (2026-11-15)
 
 ### Features
