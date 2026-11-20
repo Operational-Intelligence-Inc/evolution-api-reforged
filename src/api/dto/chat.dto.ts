@@ -36,6 +36,8 @@ export class LidMappingDto {
 export class FetchHistoryDto {
   remoteJid: string;
   count?: number;
+  /** Page back from this message instead of the oldest stored one; `timestamp` in unix seconds. */
+  anchor?: { id: string; fromMe?: boolean; participant?: string; timestamp: number };
 }
 
 export class NumberDto {

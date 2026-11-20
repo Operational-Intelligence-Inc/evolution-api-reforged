@@ -57,6 +57,16 @@ export const fetchHistorySchema: JSONSchema7 = {
   properties: {
     remoteJid: { type: 'string', minLength: 1 },
     count: { type: 'integer', minimum: 1, maximum: 50 },
+    anchor: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', minLength: 1 },
+        fromMe: { type: 'boolean' },
+        participant: { type: 'string' },
+        timestamp: { type: 'integer', minimum: 1 },
+      },
+      required: ['id', 'timestamp'],
+    },
   },
   required: ['remoteJid'],
 };

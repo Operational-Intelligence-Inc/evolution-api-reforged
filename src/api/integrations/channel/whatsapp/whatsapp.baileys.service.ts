@@ -1482,9 +1482,34 @@ export class BaileysStartupService extends ChannelStartupService {
 
         const skipped = { incomplete: 0, outOfRange: 0, known: 0 };
 
+        // Shape of rows skipped for having no content: which fields are set, never their values (see PR #65).
+        const incompleteShapes = new Map<string, number>();
+        const incompleteSamples: string[] = [];
+
         for (const m of messages) {
           if (!m.message || !m.key || !m.messageTimestamp) {
             skipped.incomplete++;
+            const fields = Object.keys(m)
+              .filter((field) => m[field] !== null && m[field] !== undefined)
+              .sort()
+              .join(',');
+            const shape = `stub=${m.messageStubType ?? '-'} fields=${fields}`;
+            incompleteShapes.set(shape, (incompleteShapes.get(shape) ?? 0) + 1);
+            if (incompleteSamples.length < 3) {
+              const ts = Long.isLong(m.messageTimestamp) ? m.messageTimestamp.toNumber() : Number(m.messageTimestamp);
+              incompleteSamples.push(
+                JSON.stringify({
+                  remoteJid: m.key?.remoteJid,
+                  id: m.key?.id,
+                  fromMe: m.key?.fromMe,
+                  participant: m.key?.participant,
+                  at: ts > 0 ? new Date(ts * 1000).toISOString() : null,
+                  stub: m.messageStubType ?? null,
+                  stubParams: m.messageStubParameters?.length ?? 0,
+                  status: m.status ?? null,
+                }),
+              );
+            }
             continue;
           }
 
@@ -1530,6 +1555,17 @@ export class BaileysStartupService extends ChannelStartupService {
               ` skippedKnown=${skipped.known} skippedIncomplete=${skipped.incomplete} skippedOutOfRange=${skipped.outOfRange}` +
               (stored.firstError ? ` firstError=${stored.firstError}` : ''),
           );
+          if (skipped.incomplete > 0) {
+            this.logger.info(
+              `history batch incomplete rows: type=${syncType} n=${skipped.incomplete} shapes=` +
+                [...incompleteShapes.entries()]
+                  .sort((a, b) => b[1] - a[1])
+                  .slice(0, 5)
+                  .map(([shape, n]) => `[${shape} x${n}]`)
+                  .join(' ') +
+                ` samples=${incompleteSamples.join(' ')}`,
+            );
+          }
           // Forget ids that never reached the table, so a later batch or re-import can still store them.
           for (const id of stored.failedIds) {
             messagesRepository?.delete(id);
@@ -5008,11 +5044,22 @@ export class BaileysStartupService extends ChannelStartupService {
       throw new BadRequestException(`Instance "${this.instance.name}" is not connected`);
     }
 
-    const oldest = await this.prismaRepository.message.findFirst({
-      where: { instanceId: this.instanceId, key: { path: ['remoteJid'], equals: remoteJid } },
-      orderBy: [{ messageTimestamp: 'asc' }],
-      select: { key: true, messageTimestamp: true },
-    });
+    // An explicit anchor (a message the phone listed without content) overrides the oldest stored message.
+    const oldest = data.anchor
+      ? {
+          key: {
+            remoteJid,
+            id: data.anchor.id,
+            fromMe: !!data.anchor.fromMe,
+            participant: data.anchor.participant,
+          },
+          messageTimestamp: data.anchor.timestamp,
+        }
+      : await this.prismaRepository.message.findFirst({
+          where: { instanceId: this.instanceId, key: { path: ['remoteJid'], equals: remoteJid } },
+          orderBy: [{ messageTimestamp: 'asc' }],
+          select: { key: true, messageTimestamp: true },
+        });
     if (!oldest) {
       throw new NotFoundException(`No stored message for "${remoteJid}" to page back from`);
     }
