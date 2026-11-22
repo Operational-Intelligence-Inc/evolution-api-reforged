@@ -1,3 +1,12 @@
+# Unreleased
+
+### Changed
+
+* **Merging into `prod` publishes a pre-release.** The image is pushed as `<version>` and `sha-<short>` only, and the GitHub Release is created as a pre-release. `latest` and `<major>.<minor>` no longer move on merge.
+  * To make a pre-release the latest release, run **Actions → Promote release** with its version. It points `latest` and `<major>.<minor>` at the same image digest, with no rebuild, and marks the GitHub Release as Latest.
+  * It refuses a version with no release, one already promoted, or one older than the current latest release.
+  * Hosts that pull `latest`, such as `docker-compose.yaml`, get a version only once it is promoted. Hosts pinned to a version are unchanged.
+
 # 3.3.0 (2026-11-21)
 
 ### Features
