@@ -78,6 +78,7 @@ import {
   QrCode,
   Reconnect,
   S3,
+  Watchdog,
 } from '@config/env.config';
 import { BadRequestException, InternalServerErrorException, NotFoundException } from '@exceptions';
 import ffmpegPath from '@ffmpeg-installer/ffmpeg';
@@ -163,7 +164,8 @@ import { v4 } from 'uuid';
 import { BaileysEventQueue, EventMap, QueueItemContext } from './baileys-event-queue';
 import { BaileysMessageProcessor } from './baileysMessage.processor';
 import { chooseBrowserIdentity, CREDS_IDENTITY_KEY, DESKTOP_IDENTITY } from './browser.identity';
-import { ConnectionHealth, ConnectionHealthReport } from './connection-health';
+import { ConnectionHealth, ConnectionHealthReport, LiveState } from './connection-health';
+import { ConnectionWatchdog, WATCHDOG_CHECK_INTERVAL_MS, WatchdogReport } from './connection-watchdog';
 import { PendingMessageUpdates } from './pending-message-updates';
 import { decideOnClose, nextConflictCount, reconnectDelayMs, STABLE_CONNECTION_MS } from './reconnect.policy';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
@@ -355,6 +357,13 @@ export class BaileysStartupService extends ChannelStartupService {
   /** Socket, reconnect, inbound and ack facts of this instance, kept in memory for connectionHealth() (see #68). */
   private readonly health = new ConnectionHealth({ keepAliveIntervalMs: KEEP_ALIVE_INTERVAL_MS });
 
+  /** Rebuilds this instance's socket when it reads 'open' but does not work (see #69). */
+  private readonly watchdog = new ConnectionWatchdog({
+    mode: this.configService.get<Watchdog>('WATCHDOG').MODE,
+    maxRebuilds: this.configService.get<Watchdog>('WATCHDOG').MAX_REBUILDS,
+  });
+  private watchdogTimer?: NodeJS.Timeout;
+
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
   private readonly UPDATE_CACHE_TTL_SECONDS = 30 * 60; // 30 minutes - avoid duplicate status updates
@@ -406,15 +415,94 @@ export class BaileysStartupService extends ChannelStartupService {
    * Health facts and a verdict for GET /instance/connectionState (see #68). Built from memory only: no database or
    * Redis I/O, so it is safe to poll.
    */
-  public connectionHealth(): ConnectionHealthReport {
-    return this.health.report({
+  public connectionHealth(): ConnectionHealthReport & { watchdog: WatchdogReport } {
+    return { ...this.health.report(this.liveState()), watchdog: this.watchdog.report() };
+  }
+
+  /** The state the health tracker does not own, read now. */
+  private liveState(): LiveState {
+    return {
       state: this.stateConnection?.state,
       wsOpen: this.client?.ws?.isOpen === true,
       attempt: this.reconnectAttempts,
       nextRetryAt: this.reconnectTimer ? (this.reconnectAt ?? null) : null,
       queueOldestAgeMs: this.eventQueue.health().oldestAgeMs,
       queueItemTimeoutMs: this.configService.get<EventQueueConf>('EVENT_QUEUE').ITEM_TIMEOUT_MS,
+    };
+  }
+
+  /** Starts this instance's watchdog checks, once (see #69). */
+  private startWatchdog() {
+    if (this.watchdog.mode === 'off' || this.watchdogTimer) {
+      return;
+    }
+
+    this.watchdogTimer = setInterval(() => {
+      this.watchdogCheck().catch((error) => this.logger.warn(`Watchdog check failed: ${error?.message ?? error}`));
+    }, WATCHDOG_CHECK_INTERVAL_MS);
+    // Never keeps the process alive on its own.
+    this.watchdogTimer.unref?.();
+  }
+
+  /** Stops the watchdog checks (logout, instance removal). The next socket starts them again. */
+  public stopWatchdog() {
+    if (this.watchdogTimer) {
+      clearInterval(this.watchdogTimer);
+      this.watchdogTimer = undefined;
+    }
+  }
+
+  /**
+   * One watchdog check (see #69). A rebuild goes through the same path as a scheduled reconnect (openSocket):
+   * createClient() ends the socket it replaces with its handlers detached, and the new socket resumes the stored
+   * session. Never a logout, never session cleanup.
+   */
+  private async watchdogCheck() {
+    const decision = this.watchdog.check({
+      state: this.stateConnection?.state,
+      // A pairing, a scheduled reconnect or a socket being created owns the socket: leave it alone.
+      busy: !!this.reconnectTimer || !!this.clientCreation || !this.instance?.authState?.state?.creds?.account,
+      reasons: this.health.stallReasons(this.liveState()),
+      queueProcessed: this.eventQueue.health().processed,
     });
+
+    if (decision.action === 'report') {
+      this.logger.warn(
+        `Watchdog (report mode): would rebuild the socket (reason ${decision.reason}); WATCHDOG_MODE=on to act`,
+      );
+      return;
+    }
+
+    if (decision.action === 'give-up') {
+      this.logger.warn(
+        `Watchdog: ${decision.rebuilds} rebuild(s) did not produce a healthy socket, stopped rebuilding ` +
+          `(reason ${decision.reason}); a connect or restart through the API resumes it`,
+      );
+      return;
+    }
+
+    if (decision.action !== 'rebuild') {
+      return;
+    }
+
+    this.logger.warn(
+      `Watchdog: socket reads open but does not work (reason ${decision.reason}), rebuilding it ` +
+        `(attempt ${decision.attempt})`,
+    );
+
+    try {
+      await this.openSocket(this.phoneNumber);
+    } catch (error) {
+      // The old socket is already gone and no new one was made, so no close event will follow: hand over to the
+      // reconnect loop, as a failed scheduled reconnect does.
+      this.logger.error(`Watchdog rebuild failed: ${error?.message ?? error}`);
+      this.scheduleReconnect(undefined);
+      if (this.reconnectTimer) {
+        await this.reportReconnecting(undefined);
+      }
+    } finally {
+      this.watchdog.rebuildFinished();
+    }
   }
 
   /** Drops the persisted events (logout, instance delete): they must not be replayed for a new session. */
@@ -424,6 +512,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async logoutInstance() {
     this.stopReconnecting();
+    this.stopWatchdog();
     this.messageProcessor.onDestroy();
     this.pendingMessageUpdates.clear();
     await this.client?.logout('Log out instance: ' + this.instanceName);
@@ -1012,6 +1101,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.eventHandler(client, generation);
     this.observeHealth(client, generation);
+    this.startWatchdog();
 
     for (const event of CALL_EVENTS) {
       client.ws.on(event, (packet) => {
@@ -1099,6 +1189,7 @@ export class BaileysStartupService extends ChannelStartupService {
    */
   public async connectToWhatsapp(number?: string): Promise<WASocket> {
     this.stopReconnecting();
+    this.watchdog.reset();
     this.instance.qrcode.count = 0;
     return this.openSocket(number);
   }

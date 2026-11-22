@@ -47,6 +47,8 @@ export type EventQueueHealth = {
   pending: number;
   /** Age of the oldest pending item, 0 when the queue is empty. */
   oldestAgeMs: number;
+  /** Items that have left the queue since it was created. Unchanged between two reads: the queue did not move. */
+  processed: number;
   /** Whether new events are currently being persisted to Redis. */
   persistent: boolean;
 };
@@ -168,6 +170,8 @@ export class BaileysEventQueue {
   private chain: Promise<void> = Promise.resolve();
   /** Arrival time of every pending item, in queue order: the head is the item running (or next to run). */
   private readonly pendingSince: number[] = [];
+  /** Items that left the queue (see EventQueueHealth.processed). */
+  private processed = 0;
   private readonly key: string;
   private lastWarnAt = 0;
   private replayed = false;
@@ -251,7 +255,7 @@ export class BaileysEventQueue {
     this.chain = this.chain
       .then(() => this.runItem(types, run, entryId))
       .finally(() => {
-        this.pendingSince.shift();
+        this.settle();
       });
   }
 
@@ -298,7 +302,7 @@ export class BaileysEventQueue {
       }
 
       if (!entries) {
-        this.pendingSince.shift();
+        this.settle();
         this.options.logger.warn('Event queue: replay read did not complete, persisted events not replayed');
         // Swallow a late rejection of the abandoned read.
         read.catch(() => undefined);
@@ -325,7 +329,7 @@ export class BaileysEventQueue {
 
           await this.runItem(Object.keys(events), (ctx) => handler(events, ctx), entry.id);
         } finally {
-          this.pendingSince.shift();
+          this.settle();
         }
       }
     });
@@ -386,6 +390,12 @@ export class BaileysEventQueue {
       .catch((error) => this.warnRateLimited(`Event queue: XDEL failed: ${error?.message ?? error}`));
   }
 
+  /** The head item left the queue, processed or given up on. */
+  private settle() {
+    this.pendingSince.shift();
+    this.processed++;
+  }
+
   public health(): EventQueueHealth {
     // The head is the oldest: live items arrive in order, and replayed entries (older still) sit in front of them.
     const oldest = this.pendingSince[0];
@@ -393,6 +403,7 @@ export class BaileysEventQueue {
     return {
       pending: this.pendingSince.length,
       oldestAgeMs: oldest === undefined ? 0 : Math.max(0, Date.now() - oldest),
+      processed: this.processed,
       persistent: this.redisReady,
     };
   }
