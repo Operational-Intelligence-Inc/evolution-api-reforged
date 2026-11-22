@@ -14,6 +14,8 @@ import { RedisClientType } from 'redis';
  * - Each item runs under a deadline: past it, the event types and the running handler are logged and the queue moves
  *   on. The hung work is left to settle on its own, and its entry is acked when it does.
  * - Without Redis (disabled, not ready, or a failed write) events are processed in memory as before.
+ * - A history batch over `maxEntryBytes` is split into parts that fit (see #74), each persisted and processed as its
+ *   own item. Any other event over it is processed without persisting.
  */
 
 /** Events persisted to the stream. Socket-lifecycle events (connection.update, creds.update, call, presence.update)
@@ -36,6 +38,8 @@ export const PERSISTED_EVENTS = [
 ] as const;
 
 const PERSISTED_EVENT_SET = new Set<string>(PERSISTED_EVENTS);
+
+export const HISTORY_EVENT = 'messaging-history.set';
 
 export type EventMap = Record<string, any>;
 
@@ -76,6 +80,20 @@ export type BaileysEventQueueOptions = {
   /** How long replay waits for the stream read before giving up on it. */
   replayReadTimeoutMs?: number;
 };
+
+/**
+ * Where a part of a split history batch sits: it holds messages [from, to) of the batch's `total` (see #74).
+ *
+ * The first part (from = 0) carries the batch's chats and every other field of the batch. Every part carries the
+ * batch's contacts, which name the senders of its messages. Only the last part (to = total) carries `progress` and
+ * `isLatest`, since only it completes the batch.
+ */
+export type HistoryPart = { from: number; to: number; total: number };
+
+/** One item to queue: the events it processes and, when they are persisted, their serialised entry. */
+type QueuePart = { events: EventMap; entry: SerializedEntry | null };
+
+type SerializedEntry = { types: string[]; json: string; bytes: number };
 
 const WARN_INTERVAL_MS = 60_000;
 const LONG_MARKER = '__evqLong';
@@ -165,6 +183,54 @@ export function pickPersistedEvents(events: EventMap): EventMap | null {
   return picked;
 }
 
+/**
+ * Messages [from, to) of the history batch in `events`, as an event batch of its own (see HistoryPart). The first part
+ * also keeps the batch's non-persisted events (socket lifecycle), which are processed ahead of the history, as they
+ * would be in the whole batch. Other data events go in `trailingPart`, processed after the last part.
+ */
+export function historyPart(events: EventMap, from: number, to: number): EventMap {
+  const history = events[HISTORY_EVENT];
+  const total: number = history.messages.length;
+  const queuePart: HistoryPart = { from, to, total };
+  const messages = history.messages.slice(from, to);
+
+  const part: EventMap = {};
+  let slice: Record<string, any>;
+
+  if (from === 0) {
+    for (const key of Object.keys(events)) {
+      if (!PERSISTED_EVENT_SET.has(key)) part[key] = events[key];
+    }
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { isLatest, progress, ...rest } = history;
+    slice = { ...rest, messages, queuePart };
+  } else {
+    slice = { chats: [], contacts: history.contacts, messages, syncType: history.syncType, queuePart };
+  }
+
+  if (to === total) {
+    slice.isLatest = history.isLatest;
+    slice.progress = history.progress;
+  }
+
+  part[HISTORY_EVENT] = slice;
+  return part;
+}
+
+/** The persisted events of `events` other than the history batch, or null when there are none. */
+export function trailingPart(events: EventMap): EventMap | null {
+  let part: EventMap | null = null;
+
+  for (const key of Object.keys(events)) {
+    if (key !== HISTORY_EVENT && PERSISTED_EVENT_SET.has(key) && events[key] !== undefined) {
+      part ??= {};
+      part[key] = events[key];
+    }
+  }
+
+  return part;
+}
+
 /** Stream IDs are `<ms>-<seq>`. */
 function streamIdTime(id: string): number {
   const ms = Number.parseInt(id, 10);
@@ -204,33 +270,61 @@ export class BaileysEventQueue {
   }
 
   /**
-   * Writes the persistable part of `events` to the stream. Must be called synchronously from the socket's event
+   * Persists and queues one event batch from the socket: `run` processes it, live or replayed. Must be called
+   * synchronously from the socket's event callback: every XADD is issued before this returns, which is what keeps
+   * stream order equal to arrival order.
+   *
+   * A history batch whose entry would exceed `maxEntryBytes` is split into parts that fit (see HistoryPart), each
+   * persisted and queued as its own item, so a restart mid-import replays the parts not yet processed. A batch that is
+   * not persisted anyway (no Redis) is never split.
+   */
+  public submit(events: EventMap, run: (events: EventMap, ctx: QueueItemContext) => Promise<void>) {
+    const entry = this.serialize(events);
+    const parts: QueuePart[] =
+      entry && entry.bytes > this.options.maxEntryBytes ? this.splitOversize(events, entry) : [{ events, entry }];
+
+    for (const part of parts) {
+      this.enqueue(Object.keys(part.events), (ctx) => run(part.events, ctx), this.write(part.entry));
+    }
+  }
+
+  /**
+   * Writes the persistable part of `events` to the stream, whole. Must be called synchronously from the socket's event
    * callback: the XADD is issued before this returns, which is what keeps stream order equal to arrival order.
    * Resolves to the entry id, or null when nothing was persisted. Never rejects.
    */
   public persist(events: EventMap): Promise<string | null> {
+    return this.write(this.serialize(events));
+  }
+
+  /** The persisted entry for `events`, or null when nothing of it is to be persisted. */
+  private serialize(events: EventMap): SerializedEntry | null {
     const picked = pickPersistedEvents(events);
-    if (!picked || !this.options.redis) return Promise.resolve(null);
+    if (!picked || !this.options.redis) return null;
 
     const types = Object.keys(picked);
 
     if (!this.redisReady) {
       this.warnRateLimited(`Event queue: Redis not ready, processing events in memory only (${types.join(', ')})`);
-      return Promise.resolve(null);
+      return null;
     }
 
-    let json: string;
     try {
-      json = serializeEvents(picked);
+      const json = serializeEvents(picked);
+      return { types, json, bytes: Buffer.byteLength(json) };
     } catch (error) {
       this.options.logger.warn(`Event queue: could not serialise ${types.join(', ')}: ${error?.message ?? error}`);
-      return Promise.resolve(null);
+      return null;
     }
+  }
 
-    const bytes = Buffer.byteLength(json);
-    if (bytes > this.options.maxEntryBytes) {
+  /** Issues the XADD for `entry`. Resolves to the entry id, or null when nothing was written. Never rejects. */
+  private write(entry: SerializedEntry | null): Promise<string | null> {
+    if (!entry) return Promise.resolve(null);
+
+    if (entry.bytes > this.options.maxEntryBytes) {
       this.options.logger.warn(
-        `Event queue: ${types.join(', ')} is ${bytes} bytes, over EVENT_QUEUE_MAX_ENTRY_BYTES ` +
+        `Event queue: ${entry.types.join(', ')} is ${entry.bytes} bytes, over EVENT_QUEUE_MAX_ENTRY_BYTES ` +
           `(${this.options.maxEntryBytes}); processing it without persisting`,
       );
       return Promise.resolve(null);
@@ -240,13 +334,55 @@ export class BaileysEventQueue {
       .xAdd(
         this.key,
         '*',
-        { e: json },
+        { e: entry.json },
         { TRIM: { strategy: 'MAXLEN', strategyModifier: '~', threshold: this.options.maxLength } },
       )
       .catch((error) => {
         this.warnRateLimited(`Event queue: XADD failed, processing events in memory only: ${error?.message ?? error}`);
         return null;
       });
+  }
+
+  /**
+   * Splits a batch whose entry (`whole`) is over the cap. Only the history batch is split, by message ranges: it starts
+   * from parts of about half the cap, and halves any part still over it. A part that cannot shrink further (one message,
+   * or a first part whose chats alone exceed the cap) is left over the cap, and write() processes it without persisting.
+   */
+  private splitOversize(events: EventMap, whole: SerializedEntry): QueuePart[] {
+    const total: number = events[HISTORY_EVENT]?.messages?.length ?? 0;
+    if (total < 2) return [{ events, entry: whole }];
+
+    const max = this.options.maxEntryBytes;
+    const parts: QueuePart[] = [];
+
+    const add = (from: number, to: number) => {
+      const part = historyPart(events, from, to);
+      const entry = this.serialize(part);
+
+      if (entry && entry.bytes > max && to - from > 1) {
+        const mid = from + Math.floor((to - from) / 2);
+        add(from, mid);
+        add(mid, to);
+        return;
+      }
+
+      parts.push({ events: part, entry });
+    };
+
+    const slices = Math.min(total, Math.ceil((2 * whole.bytes) / max));
+    for (let i = 0; i < slices; i++) {
+      add(Math.floor((i * total) / slices), Math.floor(((i + 1) * total) / slices));
+    }
+
+    const trailing = trailingPart(events);
+    if (trailing) parts.push({ events: trailing, entry: this.serialize(trailing) });
+
+    this.options.logger.info(
+      `Event queue: ${whole.types.join(', ')} is ${whole.bytes} bytes, over EVENT_QUEUE_MAX_ENTRY_BYTES (${max}); ` +
+        `split its ${total} history messages, queued as ${parts.length} items`,
+    );
+
+    return parts;
   }
 
   /**
