@@ -45,8 +45,13 @@ export type QueueItemContext = { step?: string };
 export type EventQueueHealth = {
   /** Items received but not yet processed (including the one running). */
   pending: number;
-  /** Age of the oldest pending item, 0 when the queue is empty. */
+  /** Age of the oldest pending item, 0 when the queue is empty. A backlog: says nothing about whether it moves. */
   oldestAgeMs: number;
+  /**
+   * How long the item now running has been running, 0 when none is. The item deadline bounds it, so past the deadline
+   * the deadline itself has failed and the queue has stopped.
+   */
+  runningAgeMs: number;
   /** Items that have left the queue since it was created. Unchanged between two reads: the queue did not move. */
   processed: number;
   /** Whether new events are currently being persisted to Redis. */
@@ -172,6 +177,8 @@ export class BaileysEventQueue {
   private readonly pendingSince: number[] = [];
   /** Items that left the queue (see EventQueueHealth.processed). */
   private processed = 0;
+  /** When the item now running started (see EventQueueHealth.runningAgeMs), null when none is. */
+  private runningSince: number | null = null;
   private readonly key: string;
   private lastWarnAt = 0;
   private replayed = false;
@@ -287,6 +294,9 @@ export class BaileysEventQueue {
       let entries: { id: string; message: Record<string, string> }[] | null;
       let timer: NodeJS.Timeout;
 
+      // The read holds the queue like an item does, under its own deadline.
+      this.runningSince = Date.now();
+
       try {
         entries = await Promise.race([
           read,
@@ -299,6 +309,7 @@ export class BaileysEventQueue {
         entries = null;
       } finally {
         clearTimeout(timer);
+        this.runningSince = null;
       }
 
       if (!entries) {
@@ -342,25 +353,31 @@ export class BaileysEventQueue {
   ) {
     const ctx: QueueItemContext = {};
     const startedAt = Date.now();
+    this.runningSince = startedAt;
     const work = Promise.resolve().then(() => run(ctx));
 
     // Ack once the work settles, even if that happens after the deadline below.
     work.catch(() => undefined).then(() => this.ack(entryId));
 
     let timer: NodeJS.Timeout;
-    const outcome = await Promise.race([
-      work.then(
-        () => 'done' as const,
-        (error) => {
-          this.options.logger.error(error);
-          return 'done' as const;
-        },
-      ),
-      new Promise<'timeout'>((resolve) => {
-        timer = setTimeout(() => resolve('timeout'), this.options.itemTimeoutMs);
-      }),
-    ]);
-    clearTimeout(timer);
+    let outcome: 'done' | 'timeout';
+    try {
+      outcome = await Promise.race([
+        work.then(
+          () => 'done' as const,
+          (error) => {
+            this.options.logger.error(error);
+            return 'done' as const;
+          },
+        ),
+        new Promise<'timeout'>((resolve) => {
+          timer = setTimeout(() => resolve('timeout'), this.options.itemTimeoutMs);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+      this.runningSince = null;
+    }
 
     if (outcome === 'timeout') {
       const step = ctx.step ?? 'unknown';
@@ -403,6 +420,7 @@ export class BaileysEventQueue {
     return {
       pending: this.pendingSince.length,
       oldestAgeMs: oldest === undefined ? 0 : Math.max(0, Date.now() - oldest),
+      runningAgeMs: this.runningSince === null ? 0 : Math.max(0, Date.now() - this.runningSince),
       processed: this.processed,
       persistent: this.redisReady,
     };

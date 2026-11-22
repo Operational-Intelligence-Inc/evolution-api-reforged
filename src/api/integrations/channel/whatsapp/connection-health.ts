@@ -41,6 +41,12 @@ export const UNACKED_STALL_MS = 30_000;
  */
 export const UNACKED_TTL_MS = 600_000;
 
+/**
+ * How far past its deadline the queue's running item must be before the queue reads stuck. The deadline timer fires
+ * late on a busy event loop; only a queue that is still held well after it has really stopped.
+ */
+export const QUEUE_STUCK_MARGIN_MS = 30_000;
+
 /** Most unacked sends tracked at once; the oldest is dropped past it. */
 export const MAX_TRACKED_SENDS = 1000;
 
@@ -62,7 +68,10 @@ export type HealthReason =
   | 'ws_closed'
   /** stalled: no frame from WhatsApp for KEEPALIVE_SILENT_INTERVALS keep-alive intervals. */
   | 'keepalive_silent'
-  /** stalled: the oldest queued event is older than the queue's item deadline. */
+  /**
+   * stalled: the event queue's running item has run past its deadline plus QUEUE_STUCK_MARGIN_MS, so the deadline that
+   * should have moved the queue on has failed. A backlog (old items behind slow ones) is not this.
+   */
   | 'queue_stuck'
   /** stalled: a direct send is unacked past UNACKED_STALL_MS and nothing was received since. */
   | 'sends_unacked';
@@ -77,8 +86,8 @@ export interface LiveState {
   attempt: number;
   /** When the scheduled reconnect fires (epoch ms), null when none is scheduled. */
   nextRetryAt: number | null;
-  /** Age of the oldest queued event, 0 when the queue is empty. */
-  queueOldestAgeMs: number;
+  /** How long the event queue's running item has been running, 0 when none is (EventQueueHealth.runningAgeMs). */
+  queueRunningAgeMs: number;
   /** EVENT_QUEUE_ITEM_TIMEOUT_MS. */
   queueItemTimeoutMs: number;
 }
@@ -381,7 +390,9 @@ export class ConnectionHealth {
       stalled.push('keepalive_silent');
     }
 
-    if (live.queueItemTimeoutMs > 0 && live.queueOldestAgeMs > live.queueItemTimeoutMs) stalled.push('queue_stuck');
+    if (live.queueItemTimeoutMs > 0 && live.queueRunningAgeMs > live.queueItemTimeoutMs + QUEUE_STUCK_MARGIN_MS) {
+      stalled.push('queue_stuck');
+    }
 
     if (
       oldestUnackedAt !== null &&

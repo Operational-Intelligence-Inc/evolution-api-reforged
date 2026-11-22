@@ -2,9 +2,10 @@
  * Per-instance watchdog (see #69): when an instance reads 'open' but its socket does not work, rebuild that one
  * instance's socket instead of restarting the whole service.
  *
- * - Acts on the facts of the health tracker (#68): the websocket is not open, nothing was heard for two keep-alive
- *   intervals, or the event queue's oldest item is past its deadline and the queue is not moving. Unacked sends are
- *   never a trigger: a missing ack has too many innocent causes (#67), it is only reported.
+ * - Acts on the facts of the health tracker (#68): the websocket is not open, or nothing was heard for two keep-alive
+ *   intervals. Unacked sends are never a trigger: a missing ack has too many innocent causes (#67), it is only
+ *   reported. Nor is a stuck event queue (#73): the queue belongs to the instance, not the socket, so a rebuild leaves
+ *   it as it was, and a slow queue would otherwise rebuild a working socket. It is only reported.
  * - Only while the state reads 'open' and nothing else owns the socket (a pairing, a scheduled reconnect, a socket
  *   being created), and only once a trigger has held for WATCHDOG_CONFIRM_MS, so one slow moment is not a rebuild.
  * - Rebuilds back off on the schedule of retried closes, and stop after `maxRebuilds` consecutive rebuilds that did
@@ -34,11 +35,9 @@ export const WATCHDOG_CONFIRM_MS = 30_000;
 export const WATCHDOG_HEALTHY_MS = STABLE_CONNECTION_MS;
 
 /** The health reasons that trigger a rebuild, in the order a reason is picked when several hold. */
-export const WATCHDOG_TRIGGERS = ['ws_closed', 'keepalive_silent', 'queue_stuck'] as const;
+export const WATCHDOG_TRIGGERS = ['ws_closed', 'keepalive_silent'] as const;
 
 export type WatchdogTrigger = (typeof WATCHDOG_TRIGGERS)[number];
-
-const QUEUE_STUCK: WatchdogTrigger = 'queue_stuck';
 
 export interface WatchdogInput {
   /** stateConnection.state. Only 'open' is watched. */
@@ -47,8 +46,6 @@ export interface WatchdogInput {
   busy: boolean;
   /** The health tracker's stalled reasons (ConnectionHealth.stallReasons). Those that are not triggers are ignored. */
   reasons: readonly string[];
-  /** EventQueueHealth.processed: unchanged since queue_stuck began means the queue is not moving. */
-  queueProcessed: number;
 }
 
 export type WatchdogDecision =
@@ -99,8 +96,6 @@ export class ConnectionWatchdog {
 
   /** Trigger -> when it began holding, without a break. */
   private readonly since = new Map<WatchdogTrigger, number>();
-  /** queueProcessed when queue_stuck began, or last moved. */
-  private queueProcessedAt = 0;
   /** Open with no trigger since, or null. */
   private healthySince: number | null = null;
 
@@ -136,7 +131,7 @@ export class ConnectionWatchdog {
     }
 
     const active = WATCHDOG_TRIGGERS.filter((trigger) => input.reasons.includes(trigger));
-    this.track(active, input.queueProcessed, now);
+    this.track(active, now);
 
     if (this.since.size === 0) {
       this.reported = false;
@@ -219,21 +214,13 @@ export class ConnectionWatchdog {
     };
   }
 
-  private track(active: WatchdogTrigger[], queueProcessed: number, now: number) {
+  private track(active: WatchdogTrigger[], now: number) {
     for (const trigger of [...this.since.keys()]) {
       if (!active.includes(trigger)) this.since.delete(trigger);
     }
 
     for (const trigger of active) {
-      if (trigger === QUEUE_STUCK) {
-        // A queue that is old but moving is a backlog, not a stall: start counting again from now.
-        if (!this.since.has(trigger) || queueProcessed !== this.queueProcessedAt) {
-          this.since.set(trigger, now);
-          this.queueProcessedAt = queueProcessed;
-        }
-      } else if (!this.since.has(trigger)) {
-        this.since.set(trigger, now);
-      }
+      if (!this.since.has(trigger)) this.since.set(trigger, now);
     }
   }
 }

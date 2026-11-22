@@ -2,7 +2,11 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import { BaileysEventQueue } from '../src/api/integrations/channel/whatsapp/baileys-event-queue';
-import { ConnectionHealth, LiveState } from '../src/api/integrations/channel/whatsapp/connection-health';
+import {
+  ConnectionHealth,
+  LiveState,
+  QUEUE_STUCK_MARGIN_MS,
+} from '../src/api/integrations/channel/whatsapp/connection-health';
 import {
   ConnectionWatchdog,
   DEFAULT_WATCHDOG_MAX_REBUILDS,
@@ -19,7 +23,7 @@ import {
 import { RECONNECT_DELAYS_MS } from '../src/api/integrations/channel/whatsapp/reconnect.policy';
 
 const START = Date.UTC(2026, 10, 21, 12, 0, 0);
-const OPEN: WatchdogInput = { state: 'open', busy: false, reasons: [], queueProcessed: 0 };
+const OPEN: WatchdogInput = { state: 'open', busy: false, reasons: [] };
 
 /** A watchdog on a clock the test moves by hand. `check` advances the clock by `ms` first. */
 function watchdog(mode: WatchdogMode = 'on', maxRebuilds = DEFAULT_WATCHDOG_MAX_REBUILDS) {
@@ -86,7 +90,13 @@ describe('connection watchdog (see #69)', () => {
       assert.deepEqual(w.run({ reasons: ['sends_unacked'] }, 30 * 60_000), []);
     });
 
-    it('picks ws_closed, then keepalive_silent, then queue_stuck', () => {
+    it('a stuck event queue alone never triggers a rebuild (see #73)', () => {
+      const w = watchdog();
+      assert.deepEqual(w.run({ reasons: ['queue_stuck'] }, 30 * 60_000), []);
+      assert.equal(w.dog.report().rebuilds, 0);
+    });
+
+    it('picks ws_closed, then keepalive_silent', () => {
       const w = watchdog();
 
       w.check({ reasons: ['queue_stuck', 'keepalive_silent', 'ws_closed'] });
@@ -104,25 +114,14 @@ describe('connection watchdog (see #69)', () => {
       assert.deepEqual(decision, { action: 'rebuild', reason: 'keepalive_silent', attempt: 1 });
     });
 
-    it('a queue that is old but moving is a backlog, not a trigger', () => {
+    it('a stuck queue next to a trigger does not hold the trigger up or change its reason', () => {
       const w = watchdog();
-      let processed = 0;
 
-      for (let i = 0; i < 20; i++) {
-        processed++;
-        assert.equal(
-          w.check({ reasons: ['queue_stuck'], queueProcessed: processed }, WATCHDOG_CHECK_INTERVAL_MS).action,
-          'none',
-        );
-      }
+      w.check({ reasons: ['queue_stuck'] });
+      w.check({ reasons: ['queue_stuck', 'keepalive_silent'] }, WATCHDOG_CONFIRM_MS);
+      const decision = w.check({ reasons: ['queue_stuck', 'keepalive_silent'] }, WATCHDOG_CONFIRM_MS);
 
-      // It stops moving: the confirmation counts from the last item that left it.
-      w.check({ reasons: ['queue_stuck'], queueProcessed: processed }, WATCHDOG_CONFIRM_MS - 1);
-      assert.deepEqual(w.check({ reasons: ['queue_stuck'], queueProcessed: processed }, 1), {
-        action: 'rebuild',
-        reason: 'queue_stuck',
-        attempt: 1,
-      });
+      assert.deepEqual(decision, { action: 'rebuild', reason: 'keepalive_silent', attempt: 1 });
     });
   });
 
@@ -279,9 +278,9 @@ describe('connection watchdog (see #69)', () => {
 
       w.run({ reasons: ['ws_closed'] }, 2 * 60_000);
       w.run({ reasons: [] }, WATCHDOG_CHECK_INTERVAL_MS);
-      const decisions = w.run({ reasons: ['queue_stuck'] }, 2 * 60_000);
+      const decisions = w.run({ reasons: ['keepalive_silent'] }, 2 * 60_000);
 
-      assert.deepEqual(decisions, [{ action: 'report', reason: 'queue_stuck' }]);
+      assert.deepEqual(decisions, [{ action: 'report', reason: 'keepalive_silent' }]);
       assert.equal(w.dog.report().wouldRebuild, 2);
     });
   });
@@ -341,13 +340,13 @@ describe('connection watchdog (see #69)', () => {
         wsOpen: true,
         attempt: 0,
         nextRetryAt: null,
-        queueOldestAgeMs: 0,
+        queueRunningAgeMs: 0,
         queueItemTimeoutMs: 120_000,
       };
 
       const tick = () => {
         clock.now += WATCHDOG_CHECK_INTERVAL_MS;
-        return dog.check({ state: live.state, busy: false, reasons: health.stallReasons(live), queueProcessed: 0 });
+        return dog.check({ state: live.state, busy: false, reasons: health.stallReasons(live) });
       };
 
       return { clock, health, dog, live, tick };
@@ -405,6 +404,44 @@ describe('connection watchdog (see #69)', () => {
       assert.deepEqual(i.health.stallReasons(i.live), ['keepalive_silent']);
     });
 
+    it('a backlog older than the item deadline, of items that each run longer than 30 s, is no rebuild (see #73)', () => {
+      const i = instance();
+      i.health.socketOpened();
+
+      // Items 1-4 arrive at once and take 50 s each: the head is past the 120 s deadline from t = 120 s, and nothing
+      // leaves the queue for 50 s at a time. The running item is never older than 50 s.
+      const ITEM_MS = 50_000;
+      const decisions: WatchdogDecision[] = [];
+
+      for (let elapsed = 0; elapsed < 4 * ITEM_MS; elapsed += WATCHDOG_CHECK_INTERVAL_MS) {
+        i.live.queueRunningAgeMs = elapsed % ITEM_MS;
+        i.health.frameReceived();
+        const decision = i.tick();
+        if (decision.action !== 'none') decisions.push(decision);
+        assert.deepEqual(i.health.stallReasons(i.live), []);
+      }
+
+      assert.deepEqual(decisions, []);
+    });
+
+    it('a queue whose running item is past its deadline is reported, and the socket is not rebuilt', () => {
+      const i = instance();
+      i.health.socketOpened();
+      const decisions: WatchdogDecision[] = [];
+
+      for (let n = 0; n < 60; n++) {
+        i.live.queueRunningAgeMs =
+          i.live.queueItemTimeoutMs + QUEUE_STUCK_MARGIN_MS + 1 + n * WATCHDOG_CHECK_INTERVAL_MS;
+        i.health.frameReceived();
+        const decision = i.tick();
+        if (decision.action !== 'none') decisions.push(decision);
+      }
+
+      assert.deepEqual(i.health.report(i.live).reasons, ['queue_stuck']);
+      assert.equal(i.health.report(i.live).verdict, 'stalled');
+      assert.deepEqual(decisions, []);
+    });
+
     it('unacked sends with a live socket never trigger', () => {
       const i = instance();
       i.health.socketOpened();
@@ -427,7 +464,7 @@ describe('connection watchdog (see #69)', () => {
   });
 });
 
-describe('event queue progress (see #69)', () => {
+describe('event queue progress (see #69, #73)', () => {
   const logger = { info: () => undefined, warn: () => undefined, error: () => undefined };
   const queue = () =>
     new BaileysEventQueue({
@@ -455,5 +492,25 @@ describe('event queue progress (see #69)', () => {
     release();
     await new Promise((resolve) => setTimeout(resolve, 10));
     assert.deepEqual({ pending: q.health().pending, processed: q.health().processed }, { pending: 0, processed: 2 });
+  });
+
+  it('reports how long the running item has been running, and nothing once the deadline moved the queue on', async () => {
+    const q = queue();
+    assert.equal(q.health().runningAgeMs, 0);
+
+    // Never settles: only the deadline (1 s) moves the queue past it.
+    q.enqueue(['messages.upsert'], () => new Promise<void>(() => undefined));
+    q.enqueue(['messages.update'], async () => undefined);
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const running = q.health();
+    assert.ok(running.runningAgeMs >= 150 && running.runningAgeMs < 1_000, `running ${running.runningAgeMs}`);
+    assert.equal(running.pending, 2);
+
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    assert.deepEqual(
+      { pending: q.health().pending, processed: q.health().processed, runningAgeMs: q.health().runningAgeMs },
+      { pending: 0, processed: 2, runningAgeMs: 0 },
+    );
   });
 });

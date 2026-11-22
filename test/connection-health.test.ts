@@ -11,6 +11,7 @@ import {
   LOOPING_CONFLICTS,
   LOOPING_DROPS,
   MAX_TRACKED_SENDS,
+  QUEUE_STUCK_MARGIN_MS,
   RECONNECT_WINDOW_MS,
   UNACKED_STALL_MS,
   UNACKED_TTL_MS,
@@ -36,7 +37,7 @@ function tracker() {
     wsOpen: true,
     attempt: 0,
     nextRetryAt: null,
-    queueOldestAgeMs: 0,
+    queueRunningAgeMs: 0,
     queueItemTimeoutMs: 120_000,
   };
   const advance = (ms: number) => (clock.now += ms);
@@ -454,12 +455,12 @@ describe('ConnectionHealth verdict', () => {
     assert.deepEqual(report().reasons, ['keepalive_silent']);
   });
 
-  it('is stalled when the oldest queued event is past the item deadline', () => {
+  it('is stalled when the running queue item is past its deadline plus the margin', () => {
     const { report } = opened();
 
-    assert.equal(report({ queueOldestAgeMs: 120_000 }).verdict, 'ok');
+    assert.equal(report({ queueRunningAgeMs: 120_000 + QUEUE_STUCK_MARGIN_MS }).verdict, 'ok');
 
-    const result = report({ queueOldestAgeMs: 120_001 });
+    const result = report({ queueRunningAgeMs: 120_001 + QUEUE_STUCK_MARGIN_MS });
 
     assert.equal(result.verdict, 'stalled');
     assert.deepEqual(result.reasons, ['queue_stuck']);
@@ -497,7 +498,7 @@ describe('ConnectionHealth verdict', () => {
     health.sent(PERSON, 'A');
     advance(2 * KEEP_ALIVE_MS + 1);
 
-    const result = report({ wsOpen: false, queueOldestAgeMs: 500_000 });
+    const result = report({ wsOpen: false, queueRunningAgeMs: 500_000 });
 
     assert.equal(result.verdict, 'stalled');
     assert.deepEqual(result.reasons, ['ws_closed', 'keepalive_silent', 'queue_stuck', 'sends_unacked']);
