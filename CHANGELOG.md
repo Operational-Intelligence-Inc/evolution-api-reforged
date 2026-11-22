@@ -1,3 +1,29 @@
+# 3.3.0 (2026-11-21)
+
+### Features
+
+* **Per-instance connection health** (#71, closes #68): for Baileys instances, `GET /instance/connectionState/{instance}` returns a `health` object next to `state` and `queue`. A socket can read `open` and still not work, and `health` shows when that happens.
+  * It reports socket activity (last frame, keep-alive), reconnects (opens, drops and 440 conflicts in the last 10 minutes), the last inbound message, and outbound acks.
+  * `verdict` is one of `ok`, `reconnecting`, `looping`, `stalled` or `closed`. `reasons` says why: `reconnect_loop`, `session_conflict`, `ws_closed`, `keepalive_silent`, `queue_stuck` or `sends_unacked`.
+  * It is read from memory only, with no database or Redis I/O. It holds times and counts only, with no JIDs, message IDs or message content. The counts start empty when the process starts, so read them against `observedSince`.
+  * `health.version` is `2`. A server without this feature answers without `health`.
+* **Socket watchdog** (#72, #75, closes #69 and #73): when a Baileys instance reads `open` but its socket does not work, the watchdog rebuilds that one socket. Before, the only fix was to restart the whole service.
+  * It acts on two triggers, each held for 30 s while the state reads `open`: `ws_closed` (the websocket is not open) and `keepalive_silent` (no frame for two keep-alive intervals).
+  * A rebuild opens a new socket on the stored session, the same way a scheduled reconnect does. It never logs out and never clears the session. If the new socket cannot be created, the reconnect loop takes over.
+  * Rebuilds of one instance back off from 1 s to 5 min. After `WATCHDOG_MAX_REBUILDS` (default `5`) rebuilds in a row without a healthy socket, the watchdog stops for that instance and logs one WARN. A socket that stays open for 60 s with no trigger resets the count, and so does a connect or restart through the API.
+  * New settings: `WATCHDOG_MODE` (`off`, `report` or `on`, default `report`) and `WATCHDOG_MAX_REBUILDS`. In `report` mode the watchdog logs each rebuild it would do and changes nothing. Its state is reported as `health.watchdog`.
+  * A stuck event queue is reported as `queue_stuck` but never causes a rebuild, because the queue belongs to the instance and a new socket does not reach it. `queue_stuck` now holds only when the item that is running has gone past `EVENT_QUEUE_ITEM_TIMEOUT_MS` plus 30 s. A backlog behind slow items no longer reads `stalled`.
+
+### Fixed
+
+* **Sent-message status updates are no longer lost when they arrive early** (#70, closes #67). A receipt that arrived before the sent message's row was stored was dropped, and the message stayed `PENDING`. Early updates are now held in memory and applied once the row is stored. The buffer is bounded, its entries expire, and it is cleared on logout.
+  * A sent message's stored status now only moves forward (`PENDING`, `ERROR`, `SERVER_ACK`, `DELIVERY_ACK`, `READ`, `PLAYED`). A late receipt, such as a `DELIVERY_ACK` after the `READ`, still creates its update record but no longer moves the status back.
+* **Oversize history batches are persisted in parts** (#76, closes #74). A history batch larger than `EVENT_QUEUE_MAX_ENTRY_BYTES` (8 MiB) was processed but not persisted, so a restart or deploy during the import lost it for good. Production lost 204 batches this way in six days.
+  * Such a batch is now split by message ranges into parts under the cap. Each part is persisted and processed as its own queue item, in the original order.
+  * The `history batch:` log line shows `part=from-to/total` for a split batch.
+  * Only a single message over the cap, or a batch whose chats alone are over the cap, is still processed without being persisted. Without Redis, batches are never split.
+  * For webhook consumers, a split batch sends several `MESSAGES_SET` events instead of one, with `isLatest` and `progress` only on the last. Each part after the first also sends an empty `CHATS_SET`.
+
 # 3.2.0 (2026-11-20)
 
 ### Features
