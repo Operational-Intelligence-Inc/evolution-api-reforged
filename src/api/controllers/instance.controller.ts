@@ -391,6 +391,8 @@ export class InstanceController {
         state: instance?.connectionStatus?.state,
         // Event queue lag (Baileys only, see #50): an instance whose queue is stalled still reads 'open'.
         ...(typeof instance?.eventQueueHealth === 'function' ? { queue: instance.eventQueueHealth() } : {}),
+        // Socket, reconnect, inbound and ack facts plus a verdict (Baileys only, see #68). Read from memory.
+        ...(typeof instance?.connectionHealth === 'function' ? { health: instance.connectionHealth() } : {}),
       },
     };
   }

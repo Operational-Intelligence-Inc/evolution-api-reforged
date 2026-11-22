@@ -163,6 +163,7 @@ import { v4 } from 'uuid';
 import { BaileysEventQueue, EventMap, QueueItemContext } from './baileys-event-queue';
 import { BaileysMessageProcessor } from './baileysMessage.processor';
 import { chooseBrowserIdentity, CREDS_IDENTITY_KEY, DESKTOP_IDENTITY } from './browser.identity';
+import { ConnectionHealth, ConnectionHealthReport } from './connection-health';
 import { PendingMessageUpdates } from './pending-message-updates';
 import { decideOnClose, nextConflictCount, reconnectDelayMs, STABLE_CONNECTION_MS } from './reconnect.policy';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
@@ -188,6 +189,12 @@ const CALL_EVENTS = ['CB:call', 'CB:ack,class:call'] as const;
  * reconnect, forever. We ack it ourselves (plain ack, no error code: a NACK keeps it pending server-side).
  */
 const STATUS_STANZA_EVENT = 'CB:status';
+
+/** The server's ack of a message we sent, with or without an error code. */
+const MESSAGE_ACK_EVENT = 'CB:ack,class:message';
+
+/** Baileys pings the server at this interval, and ends a socket that received nothing for it plus 5 s. */
+const KEEP_ALIVE_INTERVAL_MS = 30_000;
 
 /**
  * Whether an inbound edit comes from the author of the stored message it targets (see #25). The lookup already
@@ -341,7 +348,12 @@ export class BaileysStartupService extends ChannelStartupService {
   /** Consecutive 440 (connectionReplaced) closes; reset like reconnectAttempts (see #56). */
   private conflictCloses = 0;
   private reconnectTimer?: NodeJS.Timeout;
+  /** When reconnectTimer fires (epoch ms). */
+  private reconnectAt?: number;
   private stableConnectionTimer?: NodeJS.Timeout;
+
+  /** Socket, reconnect, inbound and ack facts of this instance, kept in memory for connectionHealth() (see #68). */
+  private readonly health = new ConnectionHealth({ keepAliveIntervalMs: KEEP_ALIVE_INTERVAL_MS });
 
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
@@ -388,6 +400,21 @@ export class BaileysStartupService extends ChannelStartupService {
   /** Lag of this instance's event queue, so consumers can alert on a stalled instance that still reads 'open'. */
   public eventQueueHealth() {
     return this.eventQueue.health();
+  }
+
+  /**
+   * Health facts and a verdict for GET /instance/connectionState (see #68). Built from memory only: no database or
+   * Redis I/O, so it is safe to poll.
+   */
+  public connectionHealth(): ConnectionHealthReport {
+    return this.health.report({
+      state: this.stateConnection?.state,
+      wsOpen: this.client?.ws?.isOpen === true,
+      attempt: this.reconnectAttempts,
+      nextRetryAt: this.reconnectTimer ? (this.reconnectAt ?? null) : null,
+      queueOldestAgeMs: this.eventQueue.health().oldestAgeMs,
+      queueItemTimeoutMs: this.configService.get<EventQueueConf>('EVENT_QUEUE').ITEM_TIMEOUT_MS,
+    });
   }
 
   /** Drops the persisted events (logout, instance delete): they must not be replayed for a new session. */
@@ -553,6 +580,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if (connection === 'close') {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
+      this.health.socketClosed(statusCode);
       this.clearStableConnectionTimer();
       this.conflictCloses = nextConflictCount(this.conflictCloses, statusCode);
 
@@ -601,6 +629,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'open') {
+      this.health.socketOpened();
       this.startStableConnectionTimer(generation);
       // A pairing that reached 'open' is over: the next one starts a fresh QR count.
       this.instance.qrcode.count = 0;
@@ -923,7 +952,7 @@ export class BaileysStartupService extends ChannelStartupService {
       maxMsgRetryCount: 4,
       fireInitQueries: true,
       connectTimeoutMs: 30_000,
-      keepAliveIntervalMs: 30_000,
+      keepAliveIntervalMs: KEEP_ALIVE_INTERVAL_MS,
       qrTimeout: 45_000,
       emitOwnEvents: false,
       shouldIgnoreJid: (jid) => {
@@ -982,6 +1011,7 @@ export class BaileysStartupService extends ChannelStartupService {
     this.eventQueue.replay((events, ctx) => this.processEvents(events, null, ctx));
 
     this.eventHandler(client, generation);
+    this.observeHealth(client, generation);
 
     for (const event of CALL_EVENTS) {
       client.ws.on(event, (packet) => {
@@ -1000,6 +1030,67 @@ export class BaileysStartupService extends ChannelStartupService {
     this.phoneNumber = number;
 
     return client;
+  }
+
+  /**
+   * Feeds this socket's frames, acks and sends to the health tracker (see #68).
+   *
+   * - Baileys emits every decoded frame as 'frame' on `ws`, and the server's ack of a send as 'CB:ack,class:message',
+   *   so both are read without patching Baileys.
+   * - Nothing in Baileys reports a send, so `sendMessage` and `relayMessage` of this socket are wrapped. Every send of
+   *   this service goes through one of the two.
+   */
+  private observeHealth(client: WASocket, generation: number) {
+    this.health.socketCreated();
+
+    client.ws.on('frame', (frame: unknown) => {
+      if (generation !== this.clientGeneration) return;
+      this.health.frameReceived(frame);
+    });
+
+    client.ws.on(MESSAGE_ACK_EVENT, (node: BinaryNode) => {
+      if (generation !== this.clientGeneration) return;
+      this.health.acked(node?.attrs?.id);
+    });
+
+    const { sendMessage, relayMessage } = client;
+
+    client.sendMessage = async (jid, content, options) => {
+      const sent = await sendMessage(jid, content, options);
+      this.health.sent(sent?.key?.remoteJid ?? jid, sent?.key?.id);
+      return sent;
+    };
+
+    client.relayMessage = async (jid, message, options) => {
+      const messageId = await relayMessage(jid, message, options);
+      this.health.sent(jid, messageId);
+      return messageId;
+    };
+  }
+
+  /**
+   * Notes the inbound messages and the receipts of a batch as it arrives from the socket, before the event queue: a
+   * stalled queue must not make the socket look silent.
+   */
+  private observeEvents(events: EventMap) {
+    try {
+      if (events['messages.upsert']?.messages?.some((message) => message?.key && !message.key.fromMe)) {
+        this.health.messageReceived();
+      }
+
+      for (const item of events['messages.update'] ?? []) {
+        if (item?.key?.fromMe && item.update?.status >= proto.WebMessageInfo.Status.SERVER_ACK) {
+          this.health.receipted(item.key.id);
+        }
+      }
+
+      for (const item of events['message-receipt.update'] ?? []) {
+        this.health.receipted(item?.key?.id);
+      }
+    } catch (error) {
+      // Bookkeeping only: it must never keep a batch from the queue.
+      this.logger.warn(`health tracking failed: ${error?.message ?? error}`);
+    }
   }
 
   /**
@@ -1049,6 +1140,7 @@ export class BaileysStartupService extends ChannelStartupService {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
     }
+    this.reconnectAt = undefined;
     this.clearStableConnectionTimer();
     this.reconnectAttempts = 0;
     this.conflictCloses = 0;
@@ -1088,8 +1180,10 @@ export class BaileysStartupService extends ChannelStartupService {
     );
 
     const generation = this.clientGeneration;
+    this.reconnectAt = Date.now() + delayMs;
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = undefined;
+      this.reconnectAt = undefined;
       if (generation !== this.clientGeneration) {
         // Something else (API connect, restart, logout) already replaced the socket.
         return;
@@ -2368,6 +2462,8 @@ export class BaileysStartupService extends ChannelStartupService {
       if (generation !== this.clientGeneration) {
         return;
       }
+
+      this.observeEvents(events as EventMap);
 
       const entryId = this.eventQueue.persist(events);
 
