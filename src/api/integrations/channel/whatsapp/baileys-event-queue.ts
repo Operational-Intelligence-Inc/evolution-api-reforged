@@ -14,6 +14,8 @@ import { RedisClientType } from 'redis';
  * - Each item runs under a deadline: past it, the event types and the running handler are logged and the queue moves
  *   on. The hung work is left to settle on its own, and its entry is acked when it does.
  * - Without Redis (disabled, not ready, or a failed write) events are processed in memory as before.
+ * - A history batch over `maxEntryBytes` is split into parts that fit (see #74), each persisted and processed as its
+ *   own item. Any other event over it is processed without persisting.
  */
 
 /** Events persisted to the stream. Socket-lifecycle events (connection.update, creds.update, call, presence.update)
@@ -37,6 +39,8 @@ export const PERSISTED_EVENTS = [
 
 const PERSISTED_EVENT_SET = new Set<string>(PERSISTED_EVENTS);
 
+export const HISTORY_EVENT = 'messaging-history.set';
+
 export type EventMap = Record<string, any>;
 
 /** Tracks which handler an item is running, so a timeout can name it. */
@@ -45,8 +49,15 @@ export type QueueItemContext = { step?: string };
 export type EventQueueHealth = {
   /** Items received but not yet processed (including the one running). */
   pending: number;
-  /** Age of the oldest pending item, 0 when the queue is empty. */
+  /** Age of the oldest pending item, 0 when the queue is empty. A backlog: says nothing about whether it moves. */
   oldestAgeMs: number;
+  /**
+   * How long the item now running has been running, 0 when none is. The item deadline bounds it, so past the deadline
+   * the deadline itself has failed and the queue has stopped.
+   */
+  runningAgeMs: number;
+  /** Items that have left the queue since it was created. Reported in the connection state only. */
+  processed: number;
   /** Whether new events are currently being persisted to Redis. */
   persistent: boolean;
 };
@@ -69,6 +80,20 @@ export type BaileysEventQueueOptions = {
   /** How long replay waits for the stream read before giving up on it. */
   replayReadTimeoutMs?: number;
 };
+
+/**
+ * Where a part of a split history batch sits: it holds messages [from, to) of the batch's `total` (see #74).
+ *
+ * The first part (from = 0) carries the batch's chats and every other field of the batch. Every part carries the
+ * batch's contacts, which name the senders of its messages. Only the last part (to = total) carries `progress` and
+ * `isLatest`, since only it completes the batch.
+ */
+export type HistoryPart = { from: number; to: number; total: number };
+
+/** One item to queue: the events it processes and, when they are persisted, their serialised entry. */
+type QueuePart = { events: EventMap; entry: SerializedEntry | null };
+
+type SerializedEntry = { types: string[]; json: string; bytes: number };
 
 const WARN_INTERVAL_MS = 60_000;
 const LONG_MARKER = '__evqLong';
@@ -158,6 +183,47 @@ export function pickPersistedEvents(events: EventMap): EventMap | null {
   return picked;
 }
 
+/**
+ * Messages [from, to) of the history batch in `events`, as an event batch of its own (see HistoryPart). The first part
+ * also keeps the batch's non-persisted events (socket lifecycle), which are processed ahead of the history, as they
+ * would be in the whole batch. Other data events go in `trailingPart`, processed after the last part.
+ */
+export function historyPart(events: EventMap, from: number, to: number): EventMap {
+  const history = events[HISTORY_EVENT];
+  const total: number = history.messages.length;
+  const queuePart: HistoryPart = { from, to, total };
+  const messages = history.messages.slice(from, to);
+
+  const part: EventMap = {};
+  let slice: Record<string, any>;
+
+  if (from === 0) {
+    for (const key of Object.keys(events)) {
+      if (!PERSISTED_EVENT_SET.has(key)) part[key] = events[key];
+    }
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { isLatest, progress, ...rest } = history;
+    slice = { ...rest, messages, queuePart };
+  } else {
+    slice = { chats: [], contacts: history.contacts, messages, syncType: history.syncType, queuePart };
+  }
+
+  if (to === total) {
+    slice.isLatest = history.isLatest;
+    slice.progress = history.progress;
+  }
+
+  part[HISTORY_EVENT] = slice;
+  return part;
+}
+
+/** The persisted events of `events` other than the history batch, or null when there are none. */
+export function trailingPart(events: EventMap): EventMap | null {
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { [HISTORY_EVENT]: history, ...rest } = events;
+  return pickPersistedEvents(rest);
+}
+
 /** Stream IDs are `<ms>-<seq>`. */
 function streamIdTime(id: string): number {
   const ms = Number.parseInt(id, 10);
@@ -168,6 +234,10 @@ export class BaileysEventQueue {
   private chain: Promise<void> = Promise.resolve();
   /** Arrival time of every pending item, in queue order: the head is the item running (or next to run). */
   private readonly pendingSince: number[] = [];
+  /** Items that left the queue (see EventQueueHealth.processed). */
+  private processed = 0;
+  /** When the item now running started (see EventQueueHealth.runningAgeMs), null when none is. */
+  private runningSince: number | null = null;
   private readonly key: string;
   private lastWarnAt = 0;
   private replayed = false;
@@ -193,33 +263,52 @@ export class BaileysEventQueue {
   }
 
   /**
-   * Writes the persistable part of `events` to the stream. Must be called synchronously from the socket's event
-   * callback: the XADD is issued before this returns, which is what keeps stream order equal to arrival order.
-   * Resolves to the entry id, or null when nothing was persisted. Never rejects.
+   * Persists and queues one event batch from the socket: `run` processes it, live or replayed. Must be called
+   * synchronously from the socket's event callback: every XADD is issued before this returns, which is what keeps
+   * stream order equal to arrival order.
+   *
+   * A history batch whose entry would exceed `maxEntryBytes` is split into parts that fit (see HistoryPart), each
+   * persisted and queued as its own item, so a restart mid-import replays the parts not yet processed. A batch that is
+   * not persisted anyway (no Redis) is never split.
    */
-  public persist(events: EventMap): Promise<string | null> {
+  public submit(events: EventMap, run: (events: EventMap, ctx: QueueItemContext) => Promise<void>) {
+    const entry = this.serialize(events);
+    const parts: QueuePart[] =
+      entry && entry.bytes > this.options.maxEntryBytes ? this.splitOversize(events, entry) : [{ events, entry }];
+
+    for (const part of parts) {
+      this.enqueue(Object.keys(part.events), (ctx) => run(part.events, ctx), this.write(part.entry));
+    }
+  }
+
+  /** The persisted entry for `events`, or null when nothing of it is to be persisted. */
+  private serialize(events: EventMap): SerializedEntry | null {
     const picked = pickPersistedEvents(events);
-    if (!picked || !this.options.redis) return Promise.resolve(null);
+    if (!picked || !this.options.redis) return null;
 
     const types = Object.keys(picked);
 
     if (!this.redisReady) {
       this.warnRateLimited(`Event queue: Redis not ready, processing events in memory only (${types.join(', ')})`);
-      return Promise.resolve(null);
+      return null;
     }
 
-    let json: string;
     try {
-      json = serializeEvents(picked);
+      const json = serializeEvents(picked);
+      return { types, json, bytes: Buffer.byteLength(json) };
     } catch (error) {
       this.options.logger.warn(`Event queue: could not serialise ${types.join(', ')}: ${error?.message ?? error}`);
-      return Promise.resolve(null);
+      return null;
     }
+  }
 
-    const bytes = Buffer.byteLength(json);
-    if (bytes > this.options.maxEntryBytes) {
+  /** Issues the XADD for `entry`. Resolves to the entry id, or null when nothing was written. Never rejects. */
+  private write(entry: SerializedEntry | null): Promise<string | null> {
+    if (!entry) return Promise.resolve(null);
+
+    if (entry.bytes > this.options.maxEntryBytes) {
       this.options.logger.warn(
-        `Event queue: ${types.join(', ')} is ${bytes} bytes, over EVENT_QUEUE_MAX_ENTRY_BYTES ` +
+        `Event queue: ${entry.types.join(', ')} is ${entry.bytes} bytes, over EVENT_QUEUE_MAX_ENTRY_BYTES ` +
           `(${this.options.maxEntryBytes}); processing it without persisting`,
       );
       return Promise.resolve(null);
@@ -229,13 +318,55 @@ export class BaileysEventQueue {
       .xAdd(
         this.key,
         '*',
-        { e: json },
+        { e: entry.json },
         { TRIM: { strategy: 'MAXLEN', strategyModifier: '~', threshold: this.options.maxLength } },
       )
       .catch((error) => {
         this.warnRateLimited(`Event queue: XADD failed, processing events in memory only: ${error?.message ?? error}`);
         return null;
       });
+  }
+
+  /**
+   * Splits a batch whose entry (`whole`) is over the cap. Only the history batch is split, by message ranges: it starts
+   * from parts of about half the cap, and halves any part still over it. A part that cannot shrink further (one message,
+   * or a first part whose chats alone exceed the cap) is left over the cap, and write() processes it without persisting.
+   */
+  private splitOversize(events: EventMap, whole: SerializedEntry): QueuePart[] {
+    const total: number = events[HISTORY_EVENT]?.messages?.length ?? 0;
+    if (total < 2) return [{ events, entry: whole }];
+
+    const max = this.options.maxEntryBytes;
+    const parts: QueuePart[] = [];
+
+    const add = (from: number, to: number) => {
+      const part = historyPart(events, from, to);
+      const entry = this.serialize(part);
+
+      if (entry && entry.bytes > max && to - from > 1) {
+        const mid = from + Math.floor((to - from) / 2);
+        add(from, mid);
+        add(mid, to);
+        return;
+      }
+
+      parts.push({ events: part, entry });
+    };
+
+    const slices = Math.min(total, Math.ceil((2 * whole.bytes) / max));
+    for (let i = 0; i < slices; i++) {
+      add(Math.floor((i * total) / slices), Math.floor(((i + 1) * total) / slices));
+    }
+
+    const trailing = trailingPart(events);
+    if (trailing) parts.push({ events: trailing, entry: this.serialize(trailing) });
+
+    this.options.logger.info(
+      `Event queue: ${whole.types.join(', ')} is ${whole.bytes} bytes, over EVENT_QUEUE_MAX_ENTRY_BYTES (${max}); ` +
+        `split its ${total} history messages, queued as ${parts.length} items`,
+    );
+
+    return parts;
   }
 
   /**
@@ -251,7 +382,7 @@ export class BaileysEventQueue {
     this.chain = this.chain
       .then(() => this.runItem(types, run, entryId))
       .finally(() => {
-        this.pendingSince.shift();
+        this.settle();
       });
   }
 
@@ -283,6 +414,9 @@ export class BaileysEventQueue {
       let entries: { id: string; message: Record<string, string> }[] | null;
       let timer: NodeJS.Timeout;
 
+      // The read holds the queue like an item does, under its own deadline.
+      this.runningSince = Date.now();
+
       try {
         entries = await Promise.race([
           read,
@@ -295,10 +429,11 @@ export class BaileysEventQueue {
         entries = null;
       } finally {
         clearTimeout(timer);
+        this.runningSince = null;
       }
 
       if (!entries) {
-        this.pendingSince.shift();
+        this.settle();
         this.options.logger.warn('Event queue: replay read did not complete, persisted events not replayed');
         // Swallow a late rejection of the abandoned read.
         read.catch(() => undefined);
@@ -325,7 +460,7 @@ export class BaileysEventQueue {
 
           await this.runItem(Object.keys(events), (ctx) => handler(events, ctx), entry.id);
         } finally {
-          this.pendingSince.shift();
+          this.settle();
         }
       }
     });
@@ -338,25 +473,31 @@ export class BaileysEventQueue {
   ) {
     const ctx: QueueItemContext = {};
     const startedAt = Date.now();
+    this.runningSince = startedAt;
     const work = Promise.resolve().then(() => run(ctx));
 
     // Ack once the work settles, even if that happens after the deadline below.
     work.catch(() => undefined).then(() => this.ack(entryId));
 
     let timer: NodeJS.Timeout;
-    const outcome = await Promise.race([
-      work.then(
-        () => 'done' as const,
-        (error) => {
-          this.options.logger.error(error);
-          return 'done' as const;
-        },
-      ),
-      new Promise<'timeout'>((resolve) => {
-        timer = setTimeout(() => resolve('timeout'), this.options.itemTimeoutMs);
-      }),
-    ]);
-    clearTimeout(timer);
+    let outcome: 'done' | 'timeout';
+    try {
+      outcome = await Promise.race([
+        work.then(
+          () => 'done' as const,
+          (error) => {
+            this.options.logger.error(error);
+            return 'done' as const;
+          },
+        ),
+        new Promise<'timeout'>((resolve) => {
+          timer = setTimeout(() => resolve('timeout'), this.options.itemTimeoutMs);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+      this.runningSince = null;
+    }
 
     if (outcome === 'timeout') {
       const step = ctx.step ?? 'unknown';
@@ -386,6 +527,12 @@ export class BaileysEventQueue {
       .catch((error) => this.warnRateLimited(`Event queue: XDEL failed: ${error?.message ?? error}`));
   }
 
+  /** The head item left the queue, processed or given up on. */
+  private settle() {
+    this.pendingSince.shift();
+    this.processed++;
+  }
+
   public health(): EventQueueHealth {
     // The head is the oldest: live items arrive in order, and replayed entries (older still) sit in front of them.
     const oldest = this.pendingSince[0];
@@ -393,6 +540,8 @@ export class BaileysEventQueue {
     return {
       pending: this.pendingSince.length,
       oldestAgeMs: oldest === undefined ? 0 : Math.max(0, Date.now() - oldest),
+      runningAgeMs: this.runningSince === null ? 0 : Math.max(0, Date.now() - this.runningSince),
+      processed: this.processed,
       persistent: this.redisReady,
     };
   }

@@ -78,6 +78,7 @@ import {
   QrCode,
   Reconnect,
   S3,
+  Watchdog,
 } from '@config/env.config';
 import { BadRequestException, InternalServerErrorException, NotFoundException } from '@exceptions';
 import ffmpegPath from '@ffmpeg-installer/ffmpeg';
@@ -88,7 +89,7 @@ import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
 import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
 import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
-import { status } from '@utils/renderStatus';
+import { sentStatusAdvances, sentStatusesBelow, status } from '@utils/renderStatus';
 import { safeFetchMedia, SafeFetchMediaResult, UnsafeMediaUrlError } from '@utils/safeFetchMedia';
 import { sendTelemetry } from '@utils/sendTelemetry';
 import useMultiFileAuthStatePrisma from '@utils/use-multi-file-auth-state-prisma';
@@ -160,9 +161,12 @@ import sharp from 'sharp';
 import { PassThrough, Readable } from 'stream';
 import { v4 } from 'uuid';
 
-import { BaileysEventQueue, EventMap, QueueItemContext } from './baileys-event-queue';
+import { BaileysEventQueue, EventMap, HistoryPart, QueueItemContext } from './baileys-event-queue';
 import { BaileysMessageProcessor } from './baileysMessage.processor';
 import { chooseBrowserIdentity, CREDS_IDENTITY_KEY, DESKTOP_IDENTITY } from './browser.identity';
+import { ConnectionHealth, ConnectionHealthReport, LiveState } from './connection-health';
+import { ConnectionWatchdog, WATCHDOG_CHECK_INTERVAL_MS, WatchdogReport } from './connection-watchdog';
+import { PendingMessageUpdates } from './pending-message-updates';
 import { decideOnClose, nextConflictCount, reconnectDelayMs, STABLE_CONNECTION_MS } from './reconnect.policy';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 
@@ -187,6 +191,12 @@ const CALL_EVENTS = ['CB:call', 'CB:ack,class:call'] as const;
  * reconnect, forever. We ack it ourselves (plain ack, no error code: a NACK keeps it pending server-side).
  */
 const STATUS_STANZA_EVENT = 'CB:status';
+
+/** The server's ack of a message we sent, with or without an error code. */
+const MESSAGE_ACK_EVENT = 'CB:ack,class:message';
+
+/** Baileys pings the server at this interval, and ends a socket that received nothing for it plus 5 s. */
+const KEEP_ALIVE_INTERVAL_MS = 30_000;
 
 /**
  * Whether an inbound edit comes from the author of the stored message it targets (see #25). The lookup already
@@ -340,11 +350,29 @@ export class BaileysStartupService extends ChannelStartupService {
   /** Consecutive 440 (connectionReplaced) closes; reset like reconnectAttempts (see #56). */
   private conflictCloses = 0;
   private reconnectTimer?: NodeJS.Timeout;
+  /** When reconnectTimer fires (epoch ms). */
+  private reconnectAt?: number;
   private stableConnectionTimer?: NodeJS.Timeout;
+
+  /** Socket, reconnect, inbound and ack facts of this instance, kept in memory for connectionHealth() (see #68). */
+  private readonly health = new ConnectionHealth({ keepAliveIntervalMs: KEEP_ALIVE_INTERVAL_MS });
+
+  /** Rebuilds this instance's socket when it reads 'open' but does not work (see #69). */
+  private readonly watchdog = new ConnectionWatchdog({
+    mode: this.configService.get<Watchdog>('WATCHDOG').MODE,
+    maxRebuilds: this.configService.get<Watchdog>('WATCHDOG').MAX_REBUILDS,
+  });
+  private watchdogTimer?: NodeJS.Timeout;
 
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
   private readonly UPDATE_CACHE_TTL_SECONDS = 30 * 60; // 30 minutes - avoid duplicate status updates
+
+  /** Updates of sent messages that arrived before the message's row was stored (see #67). */
+  private readonly pendingMessageUpdates = new PendingMessageUpdates<{
+    update: Partial<WAMessage>;
+    key: WAMessageKey;
+  }>();
 
   public stateConnection: wa.StateConnection = { state: 'close' };
 
@@ -383,13 +411,116 @@ export class BaileysStartupService extends ChannelStartupService {
     return this.eventQueue.health();
   }
 
+  /**
+   * Health facts and a verdict for GET /instance/connectionState (see #68). Built from memory only: no database or
+   * Redis I/O, so it is safe to poll.
+   */
+  public connectionHealth(): ConnectionHealthReport & { watchdog: WatchdogReport } {
+    return { ...this.health.report(this.liveState()), watchdog: this.watchdog.report() };
+  }
+
+  /** The state the health tracker does not own, read now. */
+  private liveState(): LiveState {
+    return {
+      state: this.stateConnection?.state,
+      wsOpen: this.client?.ws?.isOpen === true,
+      attempt: this.reconnectAttempts,
+      nextRetryAt: this.reconnectTimer ? (this.reconnectAt ?? null) : null,
+      queueRunningAgeMs: this.eventQueue.health().runningAgeMs,
+      queueItemTimeoutMs: this.configService.get<EventQueueConf>('EVENT_QUEUE').ITEM_TIMEOUT_MS,
+    };
+  }
+
+  /** Starts this instance's watchdog checks, once (see #69). */
+  private startWatchdog() {
+    if (this.watchdog.mode === 'off' || this.watchdogTimer) {
+      return;
+    }
+
+    this.watchdogTimer = setInterval(() => {
+      this.watchdogCheck().catch((error) => this.logger.warn(`Watchdog check failed: ${error?.message ?? error}`));
+    }, WATCHDOG_CHECK_INTERVAL_MS);
+    // Never keeps the process alive on its own.
+    this.watchdogTimer.unref?.();
+  }
+
+  /** Stops the watchdog checks (logout, instance removal). The next socket starts them again. */
+  public stopWatchdog() {
+    if (this.watchdogTimer) {
+      clearInterval(this.watchdogTimer);
+      this.watchdogTimer = undefined;
+    }
+  }
+
+  /**
+   * One watchdog check (see #69). A rebuild goes through the same path as a scheduled reconnect (openSocket):
+   * createClient() ends the socket it replaces with its handlers detached, and the new socket resumes the stored
+   * session. Never a logout, never session cleanup.
+   */
+  private async watchdogCheck() {
+    const decision = this.watchdog.check({
+      state: this.stateConnection?.state,
+      // A pairing, a scheduled reconnect or a socket being created owns the socket: leave it alone.
+      busy: !!this.reconnectTimer || !!this.clientCreation || !this.instance?.authState?.state?.creds?.account,
+      reasons: this.health.stallReasons(this.liveState()),
+    });
+
+    if (decision.action === 'report') {
+      this.logger.warn(
+        `Watchdog (report mode): would rebuild the socket (reason ${decision.reason}); WATCHDOG_MODE=on to act`,
+      );
+      return;
+    }
+
+    if (decision.action === 'give-up') {
+      this.logger.warn(
+        `Watchdog: ${decision.rebuilds} rebuild(s) did not produce a healthy socket, stopped rebuilding ` +
+          `(reason ${decision.reason}); a connect or restart through the API resumes it`,
+      );
+      return;
+    }
+
+    if (decision.action !== 'rebuild') {
+      return;
+    }
+
+    this.logger.warn(
+      `Watchdog: socket reads open but does not work (reason ${decision.reason}), rebuilding it ` +
+        `(attempt ${decision.attempt})`,
+    );
+
+    try {
+      await this.openSocket(this.phoneNumber);
+    } catch (error) {
+      // The old socket is already gone and no new one was made, so no close event will follow: hand over to the
+      // reconnect loop, as a failed scheduled reconnect does.
+      this.logger.error(`Watchdog rebuild failed: ${error?.message ?? error}`);
+      this.scheduleReconnect(undefined);
+      if (this.reconnectTimer) {
+        await this.reportReconnecting(undefined);
+      }
+    } finally {
+      this.watchdog.rebuildFinished();
+    }
+  }
+
   /** Drops the persisted events (logout, instance delete): they must not be replayed for a new session. */
   public async clearEventQueue() {
     await this.eventQueue.clear();
   }
 
-  public async logoutInstance() {
+  /**
+   * Stops what runs or is held for this instance outside a socket: the reconnect loop, the watchdog and the held
+   * message updates. Called on logout and on instance removal, so a new timer or buffer is stopped in one place.
+   */
+  public stopBackgroundWork() {
     this.stopReconnecting();
+    this.stopWatchdog();
+    this.pendingMessageUpdates.clear();
+  }
+
+  public async logoutInstance() {
+    this.stopBackgroundWork();
     this.messageProcessor.onDestroy();
     await this.client?.logout('Log out instance: ' + this.instanceName);
 
@@ -545,6 +676,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if (connection === 'close') {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
+      this.health.socketClosed(statusCode);
       this.clearStableConnectionTimer();
       this.conflictCloses = nextConflictCount(this.conflictCloses, statusCode);
 
@@ -593,6 +725,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'open') {
+      this.health.socketOpened();
       this.startStableConnectionTimer(generation);
       // A pairing that reached 'open' is over: the next one starts a fresh QR count.
       this.instance.qrcode.count = 0;
@@ -915,7 +1048,7 @@ export class BaileysStartupService extends ChannelStartupService {
       maxMsgRetryCount: 4,
       fireInitQueries: true,
       connectTimeoutMs: 30_000,
-      keepAliveIntervalMs: 30_000,
+      keepAliveIntervalMs: KEEP_ALIVE_INTERVAL_MS,
       qrTimeout: 45_000,
       emitOwnEvents: false,
       shouldIgnoreJid: (jid) => {
@@ -974,6 +1107,8 @@ export class BaileysStartupService extends ChannelStartupService {
     this.eventQueue.replay((events, ctx) => this.processEvents(events, null, ctx));
 
     this.eventHandler(client, generation);
+    this.observeHealth(client, generation);
+    this.startWatchdog();
 
     for (const event of CALL_EVENTS) {
       client.ws.on(event, (packet) => {
@@ -995,11 +1130,73 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   /**
+   * Feeds this socket's frames, acks and sends to the health tracker (see #68).
+   *
+   * - Baileys emits every decoded frame as 'frame' on `ws`, and the server's ack of a send as 'CB:ack,class:message',
+   *   so both are read without patching Baileys.
+   * - Nothing in Baileys reports a send, so `sendMessage` and `relayMessage` of this socket are wrapped. Every send of
+   *   this service goes through one of the two.
+   */
+  private observeHealth(client: WASocket, generation: number) {
+    this.health.socketCreated();
+
+    client.ws.on('frame', (frame: unknown) => {
+      if (generation !== this.clientGeneration) return;
+      this.health.frameReceived(frame);
+    });
+
+    client.ws.on(MESSAGE_ACK_EVENT, (node: BinaryNode) => {
+      if (generation !== this.clientGeneration) return;
+      this.health.acked(node?.attrs?.id);
+    });
+
+    const { sendMessage, relayMessage } = client;
+
+    client.sendMessage = async (jid, content, options) => {
+      const sent = await sendMessage(jid, content, options);
+      this.health.sent(sent?.key?.remoteJid ?? jid, sent?.key?.id);
+      return sent;
+    };
+
+    client.relayMessage = async (jid, message, options) => {
+      const messageId = await relayMessage(jid, message, options);
+      this.health.sent(jid, messageId);
+      return messageId;
+    };
+  }
+
+  /**
+   * Notes the inbound messages and the receipts of a batch as it arrives from the socket, before the event queue: a
+   * stalled queue must not make the socket look silent.
+   */
+  private observeEvents(events: EventMap) {
+    try {
+      if (events['messages.upsert']?.messages?.some((message) => message?.key && !message.key.fromMe)) {
+        this.health.messageReceived();
+      }
+
+      for (const item of events['messages.update'] ?? []) {
+        if (item?.key?.fromMe && item.update?.status >= proto.WebMessageInfo.Status.SERVER_ACK) {
+          this.health.receipted(item.key.id);
+        }
+      }
+
+      for (const item of events['message-receipt.update'] ?? []) {
+        this.health.receipted(item?.key?.id);
+      }
+    } catch (error) {
+      // Bookkeeping only: it must never keep a batch from the queue.
+      this.logger.warn(`health tracking failed: ${error?.message ?? error}`);
+    }
+  }
+
+  /**
    * Public entry point (API connect, boot auto-connect, restart, Chatwoot): starts a fresh reconnect budget and a
    * fresh QR count (see #56). Our own retries go through openSocket and keep both.
    */
   public async connectToWhatsapp(number?: string): Promise<WASocket> {
     this.stopReconnecting();
+    this.watchdog.reset();
     this.instance.qrcode.count = 0;
     return this.openSocket(number);
   }
@@ -1041,6 +1238,7 @@ export class BaileysStartupService extends ChannelStartupService {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
     }
+    this.reconnectAt = undefined;
     this.clearStableConnectionTimer();
     this.reconnectAttempts = 0;
     this.conflictCloses = 0;
@@ -1080,8 +1278,10 @@ export class BaileysStartupService extends ChannelStartupService {
     );
 
     const generation = this.clientGeneration;
+    this.reconnectAt = Date.now() + delayMs;
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = undefined;
+      this.reconnectAt = undefined;
       if (generation !== this.clientGeneration) {
         // Something else (API connect, restart, logout) already replaced the socket.
         return;
@@ -1360,6 +1560,7 @@ export class BaileysStartupService extends ChannelStartupService {
       isLatest,
       progress,
       syncType,
+      queuePart,
     }: {
       chats: Chat[];
       contacts: Contact[];
@@ -1367,6 +1568,8 @@ export class BaileysStartupService extends ChannelStartupService {
       isLatest?: boolean;
       progress?: number;
       syncType?: proto.HistorySync.HistorySyncType;
+      /** Set when the event queue split the batch (see HistoryPart): this call processes one part of it. */
+      queuePart?: HistoryPart;
     }) => {
       try {
         if (syncType === proto.HistorySync.HistorySyncType.ON_DEMAND) {
@@ -1374,8 +1577,11 @@ export class BaileysStartupService extends ChannelStartupService {
         }
         // One INFO line per batch, counts and dates only, so the reach of an import can be read from the logs.
         const batchStamps = messages.map((message) => Number(message.messageTimestamp)).filter((t) => t > 0);
+        // The first part of a split batch holds its chats, and does the batch-wide work done once per batch.
+        const firstPart = !queuePart || queuePart.from === 0;
         this.logger.info(
           `history batch: type=${syncType} msgs=${messages.length} chats=${chats.length} contacts=${contacts.length}` +
+            (queuePart ? ` part=${queuePart.from}-${queuePart.to}/${queuePart.total}` : '') +
             ` progress=${progress ?? 'n/a'} isLatest=${isLatest}` +
             (batchStamps.length
               ? ` from=${new Date(Math.min(...batchStamps) * 1000).toISOString()} to=${new Date(Math.max(...batchStamps) * 1000).toISOString()}`
@@ -1394,7 +1600,9 @@ export class BaileysStartupService extends ChannelStartupService {
 
           const maxBatchTimestamp = Math.max(...messages.map((message) => message.messageTimestamp as number));
 
-          const processBatch = maxBatchTimestamp >= timestampLimitToImport;
+          // The first part of a split batch is always processed: it holds the chats of messages in later parts, which may
+          // be recent. Its old messages are still skipped one by one below.
+          const processBatch = maxBatchTimestamp >= timestampLimitToImport || queuePart?.from === 0;
 
           if (!processBatch) {
             return;
@@ -1418,10 +1626,16 @@ export class BaileysStartupService extends ChannelStartupService {
         const knownChats: { remoteJid: string; state: ChatState }[] = [];
         // Conversation.unreadCount from history sync is WhatsApp's own count at sync time (see #1).
         const historyUnreadCounts = new Map<string, number>();
+        // Only the remote JIDs, and only when there are chats to check: later parts of a split batch carry none.
         const chatsRepository = new Set(
-          (await this.prismaRepository.chat.findMany({ where: { instanceId: this.instanceId } })).map(
-            (chat) => chat.remoteJid,
-          ),
+          chats.length
+            ? (
+                await this.prismaRepository.chat.findMany({
+                  select: { remoteJid: true },
+                  where: { instanceId: this.instanceId },
+                })
+              ).map((chat) => chat.remoteJid)
+            : [],
         );
 
         for (const chat of chats) {
@@ -1540,9 +1754,12 @@ export class BaileysStartupService extends ChannelStartupService {
           );
         }
 
-        await this.contactHandle['contacts.upsert'](
-          contacts.filter((c) => !!c.notify || !!c.name).map((c) => ({ id: c.id, name: c.name ?? c.notify })),
-        );
+        // Every part carries the batch's contacts, to name senders; they are stored once.
+        if (firstPart) {
+          await this.contactHandle['contacts.upsert'](
+            contacts.filter((c) => !!c.notify || !!c.name).map((c) => ({ id: c.id, name: c.name ?? c.notify })),
+          );
+        }
 
         contacts = undefined;
         messages = undefined;
@@ -2008,7 +2225,15 @@ export class BaileysStartupService extends ChannelStartupService {
       }
     },
 
-    'messages.update': async (args: { update: Partial<WAMessage>; key: WAMessageKey }[], settings: any) => {
+    /**
+     * @param replayed the updates were held because their message was not stored yet, and are now applied (see
+     *   replayHeldMessageUpdates). They passed the duplicate check when they first arrived.
+     */
+    'messages.update': async (
+      args: { update: Partial<WAMessage>; key: WAMessageKey }[],
+      settings: any,
+      replayed = false,
+    ) => {
       this.logger.verbose(`Update messages ${JSON.stringify(args, undefined, 2)}`);
 
       const readChatToUpdate: Record<string, true> = {}; // {remoteJid: true}
@@ -2020,7 +2245,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
         const updateKey = `${this.instance.id}_${key.id}_${update.status}`;
 
-        const cached = await this.baileysCache.get(updateKey);
+        const cached = replayed ? undefined : await this.baileysCache.get(updateKey);
 
         const secondsSinceEpoch = Math.floor(Date.now() / 1000);
         this.logger.verbose({
@@ -2096,13 +2321,29 @@ export class BaileysStartupService extends ChannelStartupService {
 
             const searchId = originalMessageId || key.id;
 
-            const messages = (await this.prismaRepository.$queryRaw`
-              SELECT * FROM "Message"
-              WHERE "instanceId" = ${this.instanceId}
-              AND "key"->>'id' = ${searchId}
-              LIMIT 1
-            `) as any[];
-            findMessage = messages[0] || null;
+            const findStoredMessage = async () => {
+              const messages = (await this.prismaRepository.$queryRaw`
+                SELECT * FROM "Message"
+                WHERE "instanceId" = ${this.instanceId}
+                AND "key"->>'id' = ${searchId}
+                LIMIT 1
+              `) as any[];
+              return messages[0] || null;
+            };
+            findMessage = await findStoredMessage();
+
+            // A send stores its row after the relay, so its ack can get here first (see #67). Keep the update:
+            // createMessageOnce applies it once the row exists. Only for sent messages, and only when new messages
+            // are stored at all. An update for an inbound message we never stored is still skipped.
+            if (!findMessage?.id && !replayed && key.fromMe && configDatabaseData.NEW_MESSAGE) {
+              if (this.pendingMessageUpdates.hold(searchId, { key, update })) {
+                this.logger.verbose(`Message ${searchId} is not stored yet. Holding its update until it is.`);
+                continue;
+              }
+
+              // The row was stored while the lookup ran, so nothing will apply a held update. Look again.
+              findMessage = await findStoredMessage();
+            }
 
             if (!findMessage?.id) {
               this.logger.warn(`Original message not found for update. Skipping. Key: ${JSON.stringify(key)}`);
@@ -2155,6 +2396,16 @@ export class BaileysStartupService extends ChannelStartupService {
                   `Update readed messages duplicated ignored in message.update [avoid deadlock]: ${messageKey}`,
                 );
               }
+            } else if (key.fromMe && sentStatusAdvances(findMessage.status, status[update.status])) {
+              // A sent message's status follows its receipts, upward only (see #67). The condition is repeated in
+              // the UPDATE because a held ack is applied from the send path while later receipts run on the queue.
+              await this.prismaRepository.message.updateMany({
+                where: {
+                  id: findMessage.id,
+                  OR: [{ status: null }, { status: { in: sentStatusesBelow(status[update.status]) } }],
+                },
+                data: { status: status[update.status] },
+              });
             }
           }
 
@@ -2319,7 +2570,8 @@ export class BaileysStartupService extends ChannelStartupService {
 
   /**
    * Queues every event batch from the socket on the instance's event queue (see #50). The persistable part is written
-   * to Redis right here, synchronously, so stream order matches arrival order and nothing awaits Redis.
+   * to Redis right here, synchronously, so stream order matches arrival order and nothing awaits Redis. A history batch
+   * too large for one stream entry arrives at processEvents as several parts (see HistoryPart, #74).
    */
   private eventHandler(client: WASocket, generation: number) {
     this.clientEventsUnsubscribe = client.ev.process(async (events) => {
@@ -2327,13 +2579,9 @@ export class BaileysStartupService extends ChannelStartupService {
         return;
       }
 
-      const entryId = this.eventQueue.persist(events);
+      this.observeEvents(events as EventMap);
 
-      this.eventQueue.enqueue(
-        Object.keys(events),
-        (ctx) => this.processEvents(events as EventMap, generation, ctx),
-        entryId,
-      );
+      this.eventQueue.submit(events as EventMap, (part, ctx) => this.processEvents(part, generation, ctx));
     });
   }
 
@@ -5185,6 +5433,34 @@ export class BaileysStartupService extends ChannelStartupService {
    * of failing the whole batch.
    */
   private async createMessageOnce(data: any): Promise<{ message: Message; created: boolean }> {
+    const result = await this.insertMessageOnce(data);
+    await this.replayHeldMessageUpdates(data?.key);
+    return result;
+  }
+
+  /**
+   * Applies the updates that arrived before this sent message was stored, typically its server ack (see #67). A
+   * failure here is logged and never fails the insert that triggered it.
+   */
+  private async replayHeldMessageUpdates(key?: { id?: string; fromMe?: boolean }): Promise<void> {
+    if (!key?.fromMe || !key.id) {
+      return;
+    }
+
+    const held = this.pendingMessageUpdates.release(key.id);
+    if (!held.length) {
+      return;
+    }
+
+    try {
+      this.logger.info(`Applying ${held.length} update(s) that arrived before message ${key.id} was stored`);
+      await this.messageHandle['messages.update'](held, this.localSettings, true);
+    } catch (error) {
+      this.logger.error({ localError: 'replayHeldMessageUpdates', keyId: key.id, error: error?.message ?? error });
+    }
+  }
+
+  private async insertMessageOnce(data: any): Promise<{ message: Message; created: boolean }> {
     try {
       return { message: await this.prismaRepository.message.create({ data }), created: true };
     } catch (error) {

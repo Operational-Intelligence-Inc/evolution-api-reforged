@@ -1,2 +1,7 @@
 import './reconnect.policy.test';
 import './browser.identity.test';
+import './pending-message-updates.test';
+import './sent.status.test';
+import './connection-health.test';
+import './connection-watchdog.test';
+import './event-queue.test';
