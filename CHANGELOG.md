@@ -1,4 +1,10 @@
-# Unreleased
+# 3.3.1 (2026-11-22)
+
+### Fixed
+
+* **Linked sessions no longer mute phone notifications** (#83, closes #82). With `alwaysOnline: false`, the default, a Baileys session still read as online, so the phone held back WhatsApp push notifications while the number was linked.
+  * Cause: Baileys sends a presence with no type, which means `available`, on almost every credentials update (pre-key uploads, app-state syncs), not only when the push name changes. It ignored `markOnlineOnConnect` and undid the `unavailable` sent on connect. On a fresh pairing, `unavailable` was never sent at all.
+  * The Baileys patch now sends that presence only when the push name actually changes, typed `unavailable` unless `alwaysOnline` is on.
 
 ### Changed
 
