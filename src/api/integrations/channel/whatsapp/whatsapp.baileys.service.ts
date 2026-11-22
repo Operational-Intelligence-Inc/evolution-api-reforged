@@ -426,7 +426,7 @@ export class BaileysStartupService extends ChannelStartupService {
       wsOpen: this.client?.ws?.isOpen === true,
       attempt: this.reconnectAttempts,
       nextRetryAt: this.reconnectTimer ? (this.reconnectAt ?? null) : null,
-      queueOldestAgeMs: this.eventQueue.health().oldestAgeMs,
+      queueRunningAgeMs: this.eventQueue.health().runningAgeMs,
       queueItemTimeoutMs: this.configService.get<EventQueueConf>('EVENT_QUEUE').ITEM_TIMEOUT_MS,
     };
   }
@@ -463,7 +463,6 @@ export class BaileysStartupService extends ChannelStartupService {
       // A pairing, a scheduled reconnect or a socket being created owns the socket: leave it alone.
       busy: !!this.reconnectTimer || !!this.clientCreation || !this.instance?.authState?.state?.creds?.account,
       reasons: this.health.stallReasons(this.liveState()),
-      queueProcessed: this.eventQueue.health().processed,
     });
 
     if (decision.action === 'report') {
