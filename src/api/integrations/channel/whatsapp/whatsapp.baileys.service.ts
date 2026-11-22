@@ -509,11 +509,19 @@ export class BaileysStartupService extends ChannelStartupService {
     await this.eventQueue.clear();
   }
 
-  public async logoutInstance() {
+  /**
+   * Stops what runs or is held for this instance outside a socket: the reconnect loop, the watchdog and the held
+   * message updates. Called on logout and on instance removal, so a new timer or buffer is stopped in one place.
+   */
+  public stopBackgroundWork() {
     this.stopReconnecting();
     this.stopWatchdog();
-    this.messageProcessor.onDestroy();
     this.pendingMessageUpdates.clear();
+  }
+
+  public async logoutInstance() {
+    this.stopBackgroundWork();
+    this.messageProcessor.onDestroy();
     await this.client?.logout('Log out instance: ' + this.instanceName);
 
     this.client?.ws?.close();
@@ -1594,7 +1602,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
           // The first part of a split batch is always processed: it holds the chats of messages in later parts, which may
           // be recent. Its old messages are still skipped one by one below.
-          const processBatch = maxBatchTimestamp >= timestampLimitToImport || (queuePart && firstPart);
+          const processBatch = maxBatchTimestamp >= timestampLimitToImport || queuePart?.from === 0;
 
           if (!processBatch) {
             return;
@@ -1618,10 +1626,16 @@ export class BaileysStartupService extends ChannelStartupService {
         const knownChats: { remoteJid: string; state: ChatState }[] = [];
         // Conversation.unreadCount from history sync is WhatsApp's own count at sync time (see #1).
         const historyUnreadCounts = new Map<string, number>();
+        // Only the remote JIDs, and only when there are chats to check: later parts of a split batch carry none.
         const chatsRepository = new Set(
-          (await this.prismaRepository.chat.findMany({ where: { instanceId: this.instanceId } })).map(
-            (chat) => chat.remoteJid,
-          ),
+          chats.length
+            ? (
+                await this.prismaRepository.chat.findMany({
+                  select: { remoteJid: true },
+                  where: { instanceId: this.instanceId },
+                })
+              ).map((chat) => chat.remoteJid)
+            : [],
         );
 
         for (const chat of chats) {

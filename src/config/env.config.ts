@@ -1,4 +1,8 @@
-import { parseWatchdogMaxRebuilds, parseWatchdogMode } from '@api/integrations/channel/whatsapp/connection-watchdog';
+import {
+  parseWatchdogMaxRebuilds,
+  parseWatchdogMode,
+  WatchdogMode,
+} from '@api/integrations/channel/whatsapp/connection-watchdog';
 import { isBooleanString } from 'class-validator';
 import dotenv from 'dotenv';
 
@@ -372,7 +376,7 @@ export type ConfigSessionPhone = { CLIENT: string; NAME: string };
 export type QrCode = { LIMIT: number; COLOR: string };
 export type Reconnect = { CONFLICT_LIMIT: number };
 /** Per-instance socket watchdog (Baileys, see #69). MODE: off, report (log only) or on. */
-export type Watchdog = { MODE: 'off' | 'report' | 'on'; MAX_REBUILDS: number };
+export type Watchdog = { MODE: WatchdogMode; MAX_REBUILDS: number };
 export type Typebot = { ENABLED: boolean; API_VERSION: string; SEND_MEDIA_BASE64: boolean };
 export type Chatwoot = {
   ENABLED: boolean;

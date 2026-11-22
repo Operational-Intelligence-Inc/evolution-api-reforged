@@ -56,7 +56,7 @@ export type EventQueueHealth = {
    * the deadline itself has failed and the queue has stopped.
    */
   runningAgeMs: number;
-  /** Items that have left the queue since it was created. Unchanged between two reads: the queue did not move. */
+  /** Items that have left the queue since it was created. Reported in the connection state only. */
   processed: number;
   /** Whether new events are currently being persisted to Redis. */
   persistent: boolean;
@@ -219,16 +219,9 @@ export function historyPart(events: EventMap, from: number, to: number): EventMa
 
 /** The persisted events of `events` other than the history batch, or null when there are none. */
 export function trailingPart(events: EventMap): EventMap | null {
-  let part: EventMap | null = null;
-
-  for (const key of Object.keys(events)) {
-    if (key !== HISTORY_EVENT && PERSISTED_EVENT_SET.has(key) && events[key] !== undefined) {
-      part ??= {};
-      part[key] = events[key];
-    }
-  }
-
-  return part;
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { [HISTORY_EVENT]: history, ...rest } = events;
+  return pickPersistedEvents(rest);
 }
 
 /** Stream IDs are `<ms>-<seq>`. */
@@ -286,15 +279,6 @@ export class BaileysEventQueue {
     for (const part of parts) {
       this.enqueue(Object.keys(part.events), (ctx) => run(part.events, ctx), this.write(part.entry));
     }
-  }
-
-  /**
-   * Writes the persistable part of `events` to the stream, whole. Must be called synchronously from the socket's event
-   * callback: the XADD is issued before this returns, which is what keeps stream order equal to arrival order.
-   * Resolves to the entry id, or null when nothing was persisted. Never rejects.
-   */
-  public persist(events: EventMap): Promise<string | null> {
-    return this.write(this.serialize(events));
   }
 
   /** The persisted entry for `events`, or null when nothing of it is to be persisted. */

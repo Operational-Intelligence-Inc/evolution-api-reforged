@@ -7,8 +7,10 @@
  *   send with its ack, and never leave this module.
  * - The facts start empty when the process starts: read them against `observedSince`.
  *
- * No dependencies (like reconnect.policy), so the unit tests don't load Baileys.
+ * No dependencies beyond reconnect.policy (itself dependency-free), so the unit tests don't load Baileys.
  */
+
+import { DisconnectReason } from './reconnect.policy';
 
 /**
  * Bumped when the shape of the report changes. Servers without this feature answer without `health`.
@@ -53,7 +55,6 @@ export const MAX_TRACKED_SENDS = 1000;
 /** Most ack ids remembered for a send that has not been recorded yet (see `acked`). */
 const MAX_EARLY_ACKS = 200;
 
-const CONNECTION_REPLACED = 440;
 /** The server's JID as Baileys decodes it from a frame (an empty user part), and its plain form. */
 const SERVER_JIDS: readonly unknown[] = ['@s.whatsapp.net', 's.whatsapp.net'];
 
@@ -168,7 +169,9 @@ export function isKeepAliveAnswer(frame: unknown): boolean {
   return node.content == null || (Array.isArray(node.content) && node.content.length === 0);
 }
 
-const iso = (time: number | null | undefined): string | null => (time == null ? null : new Date(time).toISOString());
+/** Epoch ms as an ISO string, null when unset. */
+export const iso = (time: number | null | undefined): string | null =>
+  time == null ? null : new Date(time).toISOString();
 
 export class ConnectionHealth {
   private readonly now: () => number;
@@ -227,7 +230,7 @@ export class ConnectionHealth {
       this.drops = this.inWindow(this.drops, now);
     }
 
-    if (statusCode === CONNECTION_REPLACED) {
+    if (statusCode === DisconnectReason.connectionReplaced) {
       this.conflicts.push(now);
       this.conflicts = this.inWindow(this.conflicts, now);
     }
@@ -298,8 +301,7 @@ export class ConnectionHealth {
    */
   public stallReasons(live: LiveState): HealthReason[] {
     const now = this.now();
-    this.dropExpiredSends(now);
-    const oldestUnackedAt: number | null = this.unacked.size ? this.unacked.values().next().value : null;
+    const oldestUnackedAt = this.oldestUnackedAt(now);
 
     return this.stalled(live, now, oldestUnackedAt);
   }
@@ -310,9 +312,8 @@ export class ConnectionHealth {
     this.opens = this.inWindow(this.opens, now);
     this.drops = this.inWindow(this.drops, now);
     this.conflicts = this.inWindow(this.conflicts, now);
-    this.dropExpiredSends(now);
 
-    const oldestUnackedAt: number | null = this.unacked.size ? this.unacked.values().next().value : null;
+    const oldestUnackedAt = this.oldestUnackedAt(now);
     const { verdict, reasons } = this.verdict(live, now, oldestUnackedAt);
 
     return {
@@ -408,6 +409,12 @@ export class ConnectionHealth {
   private inWindow(times: number[], now: number): number[] {
     const from = now - RECONNECT_WINDOW_MS;
     return times[0] > from ? times : times.filter((time) => time > from);
+  }
+
+  /** When the oldest send still unacked went out, after dropping expired ones; null when none is. */
+  private oldestUnackedAt(now: number): number | null {
+    this.dropExpiredSends(now);
+    return this.unacked.size ? this.unacked.values().next().value : null;
   }
 
   private dropExpiredSends(now: number): void {
