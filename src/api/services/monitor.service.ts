@@ -419,10 +419,8 @@ export class WAMonitoringService {
   private removeInstance() {
     this.eventEmitter.on('remove.instance', async (instanceName: string) => {
       try {
-        // A removed instance must not keep a scheduled reconnect alive.
-        this.waInstances[instanceName]?.stopReconnecting?.();
-        // Nor its watchdog (see #69).
-        this.waInstances[instanceName]?.stopWatchdog?.();
+        // A removed instance must not keep a scheduled reconnect, its watchdog (see #69) or held updates alive.
+        this.waInstances[instanceName]?.stopBackgroundWork?.();
 
         // Nor leave persisted events behind (see #50); logout already clears them when the instance was connected.
         await this.waInstances[instanceName]?.clearEventQueue?.();

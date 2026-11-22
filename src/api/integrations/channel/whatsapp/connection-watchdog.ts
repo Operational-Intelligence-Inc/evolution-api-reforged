@@ -14,6 +14,7 @@
  *   Baileys.
  */
 
+import { iso } from './connection-health';
 import { reconnectDelayMs, STABLE_CONNECTION_MS } from './reconnect.policy';
 
 /** off: do nothing. report: log what would be rebuilt, change nothing. on: rebuild. */
@@ -86,8 +87,6 @@ export function parseWatchdogMaxRebuilds(value: string | undefined): number {
   const max = Number.parseInt(value ?? '', 10);
   return Number.isFinite(max) && max >= 1 ? max : DEFAULT_WATCHDOG_MAX_REBUILDS;
 }
-
-const iso = (time: number | null): string | null => (time == null ? null : new Date(time).toISOString());
 
 export class ConnectionWatchdog {
   public readonly mode: WatchdogMode;

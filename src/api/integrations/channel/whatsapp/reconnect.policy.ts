@@ -2,7 +2,7 @@
  * Baileys DisconnectReason values used here. Kept local (not imported from 'baileys') so this module has no
  * dependencies and its unit tests don't load Baileys.
  */
-const DisconnectReason = {
+export const DisconnectReason = {
   loggedOut: 401,
   forbidden: 403,
   connectionReplaced: 440,
