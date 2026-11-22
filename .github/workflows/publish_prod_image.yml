@@ -1,7 +1,9 @@
 name: Publish prod image
 
-# Every merge into `prod` is a release: the version in package.json becomes the image tag, a `v<version>` git tag and a
-# GitHub Release. A merge that does not bump the version fails instead of overwriting an image already published.
+# Every merge into `prod` is a pre-release: the version in package.json becomes the image tag, a `v<version>` git tag
+# and a GitHub pre-release. Only `<version>` and `sha-<short>` are pushed; `<major>.<minor>` and `latest` keep pointing
+# at the last promoted release until the "Promote release" workflow (promote_release.yml) moves them.
+# A merge that does not bump the version fails instead of overwriting an image already published.
 
 on:
   push:
@@ -66,11 +68,11 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ steps.version.outputs.image }}
+          # metadata-action adds `latest` to a semver tag by default; only promote_release.yml may move it.
+          flavor: latest=false
           tags: |
             type=semver,pattern={{version}},value=${{ steps.version.outputs.version }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.version }}
             type=sha,prefix=sha-
-            type=raw,value=latest
 
       - uses: docker/setup-buildx-action@v3
 
@@ -103,5 +105,7 @@ jobs:
           gh release create "v$VERSION" \
             --target "$GITHUB_SHA" \
             --title "v$VERSION" \
+            --prerelease \
+            --latest=false \
             --generate-notes \
-            --notes "Image: \`$IMAGE:$VERSION\` (\`$DIGEST\`)"
+            --notes "Image: \`$IMAGE:$VERSION\` (\`$DIGEST\`). Pre-release: \`latest\` moves here once it is promoted (Actions → Promote release)."
