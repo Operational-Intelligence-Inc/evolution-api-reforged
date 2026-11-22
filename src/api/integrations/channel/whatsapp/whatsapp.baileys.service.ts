@@ -88,7 +88,7 @@ import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
 import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
 import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
-import { status } from '@utils/renderStatus';
+import { sentStatusAdvances, sentStatusesBelow, status } from '@utils/renderStatus';
 import { safeFetchMedia, SafeFetchMediaResult, UnsafeMediaUrlError } from '@utils/safeFetchMedia';
 import { sendTelemetry } from '@utils/sendTelemetry';
 import useMultiFileAuthStatePrisma from '@utils/use-multi-file-auth-state-prisma';
@@ -163,6 +163,7 @@ import { v4 } from 'uuid';
 import { BaileysEventQueue, EventMap, QueueItemContext } from './baileys-event-queue';
 import { BaileysMessageProcessor } from './baileysMessage.processor';
 import { chooseBrowserIdentity, CREDS_IDENTITY_KEY, DESKTOP_IDENTITY } from './browser.identity';
+import { PendingMessageUpdates } from './pending-message-updates';
 import { decideOnClose, nextConflictCount, reconnectDelayMs, STABLE_CONNECTION_MS } from './reconnect.policy';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 
@@ -346,6 +347,12 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
   private readonly UPDATE_CACHE_TTL_SECONDS = 30 * 60; // 30 minutes - avoid duplicate status updates
 
+  /** Updates of sent messages that arrived before the message's row was stored (see #67). */
+  private readonly pendingMessageUpdates = new PendingMessageUpdates<{
+    update: Partial<WAMessage>;
+    key: WAMessageKey;
+  }>();
+
   public stateConnection: wa.StateConnection = { state: 'close' };
 
   public phoneNumber: string;
@@ -391,6 +398,7 @@ export class BaileysStartupService extends ChannelStartupService {
   public async logoutInstance() {
     this.stopReconnecting();
     this.messageProcessor.onDestroy();
+    this.pendingMessageUpdates.clear();
     await this.client?.logout('Log out instance: ' + this.instanceName);
 
     this.client?.ws?.close();
@@ -2008,7 +2016,15 @@ export class BaileysStartupService extends ChannelStartupService {
       }
     },
 
-    'messages.update': async (args: { update: Partial<WAMessage>; key: WAMessageKey }[], settings: any) => {
+    /**
+     * @param replayed the updates were held because their message was not stored yet, and are now applied (see
+     *   replayHeldMessageUpdates). They passed the duplicate check when they first arrived.
+     */
+    'messages.update': async (
+      args: { update: Partial<WAMessage>; key: WAMessageKey }[],
+      settings: any,
+      replayed = false,
+    ) => {
       this.logger.verbose(`Update messages ${JSON.stringify(args, undefined, 2)}`);
 
       const readChatToUpdate: Record<string, true> = {}; // {remoteJid: true}
@@ -2020,7 +2036,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
         const updateKey = `${this.instance.id}_${key.id}_${update.status}`;
 
-        const cached = await this.baileysCache.get(updateKey);
+        const cached = replayed ? undefined : await this.baileysCache.get(updateKey);
 
         const secondsSinceEpoch = Math.floor(Date.now() / 1000);
         this.logger.verbose({
@@ -2096,13 +2112,29 @@ export class BaileysStartupService extends ChannelStartupService {
 
             const searchId = originalMessageId || key.id;
 
-            const messages = (await this.prismaRepository.$queryRaw`
-              SELECT * FROM "Message"
-              WHERE "instanceId" = ${this.instanceId}
-              AND "key"->>'id' = ${searchId}
-              LIMIT 1
-            `) as any[];
-            findMessage = messages[0] || null;
+            const findStoredMessage = async () => {
+              const messages = (await this.prismaRepository.$queryRaw`
+                SELECT * FROM "Message"
+                WHERE "instanceId" = ${this.instanceId}
+                AND "key"->>'id' = ${searchId}
+                LIMIT 1
+              `) as any[];
+              return messages[0] || null;
+            };
+            findMessage = await findStoredMessage();
+
+            // A send stores its row after the relay, so its ack can get here first (see #67). Keep the update:
+            // createMessageOnce applies it once the row exists. Only for sent messages, and only when new messages
+            // are stored at all. An update for an inbound message we never stored is still skipped.
+            if (!findMessage?.id && !replayed && key.fromMe && configDatabaseData.NEW_MESSAGE) {
+              if (this.pendingMessageUpdates.hold(searchId, { key, update })) {
+                this.logger.verbose(`Message ${searchId} is not stored yet. Holding its update until it is.`);
+                continue;
+              }
+
+              // The row was stored while the lookup ran, so nothing will apply a held update. Look again.
+              findMessage = await findStoredMessage();
+            }
 
             if (!findMessage?.id) {
               this.logger.warn(`Original message not found for update. Skipping. Key: ${JSON.stringify(key)}`);
@@ -2155,6 +2187,16 @@ export class BaileysStartupService extends ChannelStartupService {
                   `Update readed messages duplicated ignored in message.update [avoid deadlock]: ${messageKey}`,
                 );
               }
+            } else if (key.fromMe && sentStatusAdvances(findMessage.status, status[update.status])) {
+              // A sent message's status follows its receipts, upward only (see #67). The condition is repeated in
+              // the UPDATE because a held ack is applied from the send path while later receipts run on the queue.
+              await this.prismaRepository.message.updateMany({
+                where: {
+                  id: findMessage.id,
+                  OR: [{ status: null }, { status: { in: sentStatusesBelow(status[update.status]) } }],
+                },
+                data: { status: status[update.status] },
+              });
             }
           }
 
@@ -5185,6 +5227,34 @@ export class BaileysStartupService extends ChannelStartupService {
    * of failing the whole batch.
    */
   private async createMessageOnce(data: any): Promise<{ message: Message; created: boolean }> {
+    const result = await this.insertMessageOnce(data);
+    await this.replayHeldMessageUpdates(data?.key);
+    return result;
+  }
+
+  /**
+   * Applies the updates that arrived before this sent message was stored, typically its server ack (see #67). A
+   * failure here is logged and never fails the insert that triggered it.
+   */
+  private async replayHeldMessageUpdates(key?: { id?: string; fromMe?: boolean }): Promise<void> {
+    if (!key?.fromMe || !key.id) {
+      return;
+    }
+
+    const held = this.pendingMessageUpdates.release(key.id);
+    if (!held.length) {
+      return;
+    }
+
+    try {
+      this.logger.info(`Applying ${held.length} update(s) that arrived before message ${key.id} was stored`);
+      await this.messageHandle['messages.update'](held, this.localSettings, true);
+    } catch (error) {
+      this.logger.error({ localError: 'replayHeldMessageUpdates', keyId: key.id, error: error?.message ?? error });
+    }
+  }
+
+  private async insertMessageOnce(data: any): Promise<{ message: Message; created: boolean }> {
     try {
       return { message: await this.prismaRepository.message.create({ data }), created: true };
     } catch (error) {
