@@ -10,8 +10,11 @@
  * No dependencies (like reconnect.policy), so the unit tests don't load Baileys.
  */
 
-/** Bumped when the shape of the report changes. Servers without this feature answer without `health`. */
-export const HEALTH_VERSION = 1;
+/**
+ * Bumped when the shape of the report changes. Servers without this feature answer without `health`.
+ * 2: `watchdog` (see #69).
+ */
+export const HEALTH_VERSION = 2;
 
 /** Window of `reconnects.opens`, `reconnects.drops` and `reconnects.conflicts`. */
 export const RECONNECT_WINDOW_MS = 600_000;
@@ -279,6 +282,19 @@ export class ConnectionHealth {
     }
   }
 
+  /**
+   * The `stalled` reasons that hold now, read whatever the verdict is: a looping instance that reads 'open' can be
+   * stalled too, and the verdict would only say `looping`. The caller decides whether the state makes them count.
+   * Used by the watchdog (see #69).
+   */
+  public stallReasons(live: LiveState): HealthReason[] {
+    const now = this.now();
+    this.dropExpiredSends(now);
+    const oldestUnackedAt: number | null = this.unacked.size ? this.unacked.values().next().value : null;
+
+    return this.stalled(live, now, oldestUnackedAt);
+  }
+
   public report(live: LiveState): ConnectionHealthReport {
     const now = this.now();
 
@@ -348,6 +364,13 @@ export class ConnectionHealth {
       return { verdict: 'reconnecting', reasons: [] };
     }
 
+    const stalled = this.stalled(live, now, oldestUnackedAt);
+
+    return stalled.length ? { verdict: 'stalled', reasons: stalled } : { verdict: 'ok', reasons: [] };
+  }
+
+  /** The `stalled` reasons that hold now, whatever the state and the verdict. */
+  private stalled(live: LiveState, now: number, oldestUnackedAt: number | null): HealthReason[] {
     const stalled: HealthReason[] = [];
 
     if (!live.wsOpen) stalled.push('ws_closed');
@@ -368,7 +391,7 @@ export class ConnectionHealth {
       stalled.push('sends_unacked');
     }
 
-    return stalled.length ? { verdict: 'stalled', reasons: stalled } : { verdict: 'ok', reasons: [] };
+    return stalled;
   }
 
   private inWindow(times: number[], now: number): number[] {

@@ -1,3 +1,4 @@
+import { parseWatchdogMaxRebuilds, parseWatchdogMode } from '@api/integrations/channel/whatsapp/connection-watchdog';
 import { isBooleanString } from 'class-validator';
 import dotenv from 'dotenv';
 
@@ -370,6 +371,8 @@ export type Pusher = { ENABLED: boolean; GLOBAL?: GlobalPusher; EVENTS: EventsPu
 export type ConfigSessionPhone = { CLIENT: string; NAME: string };
 export type QrCode = { LIMIT: number; COLOR: string };
 export type Reconnect = { CONFLICT_LIMIT: number };
+/** Per-instance socket watchdog (Baileys, see #69). MODE: off, report (log only) or on. */
+export type Watchdog = { MODE: 'off' | 'report' | 'on'; MAX_REBUILDS: number };
 export type Typebot = { ENABLED: boolean; API_VERSION: string; SEND_MEDIA_BASE64: boolean };
 export type Chatwoot = {
   ENABLED: boolean;
@@ -468,6 +471,7 @@ export interface Env {
   CONFIG_SESSION_PHONE: ConfigSessionPhone;
   QRCODE: QrCode;
   RECONNECT: Reconnect;
+  WATCHDOG: Watchdog;
   TYPEBOT: Typebot;
   CHATWOOT: Chatwoot;
   OPENAI: Openai;
@@ -866,6 +870,10 @@ export class ConfigService {
           const limit = Number.parseInt(process.env?.RECONNECT_CONFLICT_LIMIT);
           return Number.isFinite(limit) && limit >= 0 ? limit : 10;
         })(),
+      },
+      WATCHDOG: {
+        MODE: parseWatchdogMode(process.env?.WATCHDOG_MODE),
+        MAX_REBUILDS: parseWatchdogMaxRebuilds(process.env?.WATCHDOG_MAX_REBUILDS),
       },
       TYPEBOT: {
         ENABLED: process.env?.TYPEBOT_ENABLED === 'true',
