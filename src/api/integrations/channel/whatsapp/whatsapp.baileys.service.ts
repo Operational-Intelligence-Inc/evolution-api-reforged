@@ -161,7 +161,7 @@ import sharp from 'sharp';
 import { PassThrough, Readable } from 'stream';
 import { v4 } from 'uuid';
 
-import { BaileysEventQueue, EventMap, QueueItemContext } from './baileys-event-queue';
+import { BaileysEventQueue, EventMap, HistoryPart, QueueItemContext } from './baileys-event-queue';
 import { BaileysMessageProcessor } from './baileysMessage.processor';
 import { chooseBrowserIdentity, CREDS_IDENTITY_KEY, DESKTOP_IDENTITY } from './browser.identity';
 import { ConnectionHealth, ConnectionHealthReport, LiveState } from './connection-health';
@@ -1552,6 +1552,7 @@ export class BaileysStartupService extends ChannelStartupService {
       isLatest,
       progress,
       syncType,
+      queuePart,
     }: {
       chats: Chat[];
       contacts: Contact[];
@@ -1559,6 +1560,8 @@ export class BaileysStartupService extends ChannelStartupService {
       isLatest?: boolean;
       progress?: number;
       syncType?: proto.HistorySync.HistorySyncType;
+      /** Set when the event queue split the batch (see HistoryPart): this call processes one part of it. */
+      queuePart?: HistoryPart;
     }) => {
       try {
         if (syncType === proto.HistorySync.HistorySyncType.ON_DEMAND) {
@@ -1566,8 +1569,11 @@ export class BaileysStartupService extends ChannelStartupService {
         }
         // One INFO line per batch, counts and dates only, so the reach of an import can be read from the logs.
         const batchStamps = messages.map((message) => Number(message.messageTimestamp)).filter((t) => t > 0);
+        // The first part of a split batch holds its chats, and does the batch-wide work done once per batch.
+        const firstPart = !queuePart || queuePart.from === 0;
         this.logger.info(
           `history batch: type=${syncType} msgs=${messages.length} chats=${chats.length} contacts=${contacts.length}` +
+            (queuePart ? ` part=${queuePart.from}-${queuePart.to}/${queuePart.total}` : '') +
             ` progress=${progress ?? 'n/a'} isLatest=${isLatest}` +
             (batchStamps.length
               ? ` from=${new Date(Math.min(...batchStamps) * 1000).toISOString()} to=${new Date(Math.max(...batchStamps) * 1000).toISOString()}`
@@ -1586,7 +1592,9 @@ export class BaileysStartupService extends ChannelStartupService {
 
           const maxBatchTimestamp = Math.max(...messages.map((message) => message.messageTimestamp as number));
 
-          const processBatch = maxBatchTimestamp >= timestampLimitToImport;
+          // The first part of a split batch is always processed: it holds the chats of messages in later parts, which may
+          // be recent. Its old messages are still skipped one by one below.
+          const processBatch = maxBatchTimestamp >= timestampLimitToImport || (queuePart && firstPart);
 
           if (!processBatch) {
             return;
@@ -1732,9 +1740,12 @@ export class BaileysStartupService extends ChannelStartupService {
           );
         }
 
-        await this.contactHandle['contacts.upsert'](
-          contacts.filter((c) => !!c.notify || !!c.name).map((c) => ({ id: c.id, name: c.name ?? c.notify })),
-        );
+        // Every part carries the batch's contacts, to name senders; they are stored once.
+        if (firstPart) {
+          await this.contactHandle['contacts.upsert'](
+            contacts.filter((c) => !!c.notify || !!c.name).map((c) => ({ id: c.id, name: c.name ?? c.notify })),
+          );
+        }
 
         contacts = undefined;
         messages = undefined;
@@ -2545,7 +2556,8 @@ export class BaileysStartupService extends ChannelStartupService {
 
   /**
    * Queues every event batch from the socket on the instance's event queue (see #50). The persistable part is written
-   * to Redis right here, synchronously, so stream order matches arrival order and nothing awaits Redis.
+   * to Redis right here, synchronously, so stream order matches arrival order and nothing awaits Redis. A history batch
+   * too large for one stream entry arrives at processEvents as several parts (see HistoryPart, #74).
    */
   private eventHandler(client: WASocket, generation: number) {
     this.clientEventsUnsubscribe = client.ev.process(async (events) => {
@@ -2555,13 +2567,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
       this.observeEvents(events as EventMap);
 
-      const entryId = this.eventQueue.persist(events);
-
-      this.eventQueue.enqueue(
-        Object.keys(events),
-        (ctx) => this.processEvents(events as EventMap, generation, ctx),
-        entryId,
-      );
+      this.eventQueue.submit(events as EventMap, (part, ctx) => this.processEvents(part, generation, ctx));
     });
   }
 
