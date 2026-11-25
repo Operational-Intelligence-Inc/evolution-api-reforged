@@ -1,14 +1,14 @@
-# Unreleased
+# 3.3.2 (2026-11-25)
 
 ### Fixed
 
-* **`POST /chat/getBase64FromMediaMessage` no longer returns media from another chat** (closes #86). The route reloaded the stored message by `key.id` alone, with no order and no limit. A WhatsApp message id is unique only within one chat and direction, so when two chats shared an id it could return the other chat's file.
+* **`POST /chat/getBase64FromMediaMessage` no longer returns media from another chat** (#87, closes #86). The route reloaded the stored message by `key.id` alone, with no order and no limit. A WhatsApp message id is unique only within one chat and direction, so when two chats shared an id it could return the other chat's file.
   * When `message.key.remoteJid` is sent, the message is loaded by its full key: that chat, `key.id` and `key.fromMe` (missing counts as `false`). A LID chat matches by its phone-number JID too. If no such message is stored, the route answers `Message not found` and never falls back to the id-only lookup.
   * The lookup is served by the `Message_instanceId_key_unique` index instead of scanning the instance's messages.
   * Without `key.remoteJid` the id-only lookup is kept, as before. It is now ordered (newest first, `LIMIT 1`), so a shared id returns the same row every time.
   * `message.key.id` must be a string, and `message.key.remoteJid` a string when present; anything else is a 400.
   * Editing a message (`POST /chat/updateMessage`) and reloading a quoted message by key use the full key too when it carries `remoteJid`. Baileys' own message callback (retry decryption, poll votes) still looks up by id alone, because it may pass the phone-number JID for a row stored under the LID.
-* **Baileys sessions ack contacts' statuses again** (merged from upstream 2.3.8). WhatsApp now sends contacts' statuses as a top-level `<status>` stanza, which Baileys `7.0.0-rc14` never acked.
+* **Baileys sessions ack contacts' statuses again** (#88, merged from upstream 2.3.8). WhatsApp now sends contacts' statuses as a top-level `<status>` stanza, which Baileys `7.0.0-rc14` never acked.
   * Fixes sessions that read `open` and can send but stop receiving messages, or receive them hours late.
   * Fixes the connection dropping with `stream errored out` (`ack class="status"`) about every 50 minutes.
   * Held-back messages arrive after updating, with no new QR scan. A failed status ack no longer stops processing of offline messages.
