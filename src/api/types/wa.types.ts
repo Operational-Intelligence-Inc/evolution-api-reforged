@@ -143,11 +143,16 @@ export const TypeMediaMessage = [
   'ptvMessage',
 ];
 
+/**
+ * Transparent `{ message: Message }` wrappers (Baileys' FutureProofMessage) around a message's real content.
+ * `associatedChildMessage` holds album items, the photos and videos sent several at a time (#91).
+ */
 export const MessageSubtype = [
   'ephemeralMessage',
   'documentWithCaptionMessage',
   'viewOnceMessage',
   'viewOnceMessageV2',
+  'associatedChildMessage',
 ];
 
 export const Integration = {

@@ -6,3 +6,4 @@ import './connection-health.test';
 import './connection-watchdog.test';
 import './event-queue.test';
 import './message-lookup.test';
+import './media-message.test';
