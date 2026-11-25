@@ -166,6 +166,7 @@ import { BaileysMessageProcessor } from './baileysMessage.processor';
 import { chooseBrowserIdentity, CREDS_IDENTITY_KEY, DESKTOP_IDENTITY } from './browser.identity';
 import { ConnectionHealth, ConnectionHealthReport, LiveState } from './connection-health';
 import { ConnectionWatchdog, WATCHDOG_CHECK_INTERVAL_MS, WatchdogReport } from './connection-watchdog';
+import { alternateChatQuery, fullKeyQuery, hasChat, idOnlyQuery } from './message-lookup';
 import { PendingMessageUpdates } from './pending-message-updates';
 import { decideOnClose, nextConflictCount, reconnectDelayMs, STABLE_CONNECTION_MS } from './reconnect.policy';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
@@ -834,14 +835,17 @@ export class BaileysStartupService extends ChannelStartupService {
     });
   }
 
+  /**
+   * Loads a stored message by id alone. An id is unique only within a chat and direction, so this can return
+   * another chat's message when ids collide; the query is ordered so it at least returns the same row every time.
+   * Use getMessageByFullKey when the caller knows the chat. Baileys' getMessage callback stays on this path
+   * because it may pass the PN JID for a row stored under the LID (#86).
+   */
   private async getMessage(key: proto.IMessageKey, full = false) {
     try {
-      // Use raw SQL to avoid JSON path issues
-      const webMessageInfo = (await this.prismaRepository.$queryRaw`
-        SELECT * FROM "Message"
-        WHERE "instanceId" = ${this.instanceId}
-        AND "key"->>'id' = ${key.id}
-      `) as proto.IWebMessageInfo[];
+      const webMessageInfo = (await this.prismaRepository.$queryRaw(
+        idOnlyQuery(this.instanceId, key.id),
+      )) as proto.IWebMessageInfo[];
 
       if (full) {
         return webMessageInfo[0];
@@ -865,6 +869,33 @@ export class BaileysStartupService extends ChannelStartupService {
     } catch {
       return { conversation: '' };
     }
+  }
+
+  /**
+   * Loads a stored message by its full key: the same chat (remoteJid, or its LID/PN alternate), id and direction
+   * (a missing fromMe counts as received). Returns null when no such message is stored; never falls back to a
+   * lookup by id alone, which could return another chat's message (#86).
+   */
+  private async getMessageByFullKey(key: ExtendedIMessageKey): Promise<Message | null> {
+    if (!hasChat(key) || typeof key?.id !== 'string' || !key.id) {
+      return null;
+    }
+
+    const exact = (await this.prismaRepository.$queryRaw(fullKeyQuery(this.instanceId, key))) as Message[];
+    if (exact[0]) {
+      return exact[0];
+    }
+
+    const alternate = (await this.prismaRepository.$queryRaw(alternateChatQuery(this.instanceId, key))) as Message[];
+    return alternate[0] ?? null;
+  }
+
+  /** The stored message for a key: by full key when the key names its chat, otherwise by id alone. */
+  private async getMessageForKey(key: ExtendedIMessageKey): Promise<proto.IWebMessageInfo | undefined> {
+    if (hasChat(key)) {
+      return ((await this.getMessageByFullKey(key)) ?? undefined) as unknown as proto.IWebMessageInfo | undefined;
+    }
+    return (await this.getMessage(key, true)) as proto.IWebMessageInfo | undefined;
   }
 
   private async defineAuthState() {
@@ -3129,7 +3160,7 @@ export class BaileysStartupService extends ChannelStartupService {
       if (options?.quoted) {
         const m = options?.quoted;
 
-        const msg = m?.message ? m : ((await this.getMessage(m.key, true)) as WAMessage);
+        const msg = m?.message ? m : ((await this.getMessageForKey(m.key)) as WAMessage);
 
         if (msg) {
           quoted = msg;
@@ -4590,12 +4621,19 @@ export class BaileysStartupService extends ChannelStartupService {
       const m = data?.message;
       const convertToMp4 = data?.convertToMp4 ?? false;
 
-      if (!trustMessageContent && !m?.key?.id) {
-        throw new BadRequestException('message.key.id is required');
+      if (!trustMessageContent) {
+        if (typeof m?.key?.id !== 'string' || !m.key.id) {
+          throw new BadRequestException('message.key.id is required');
+        }
+        const remoteJid = m.key.remoteJid as unknown;
+        if (remoteJid !== undefined && remoteJid !== null && typeof remoteJid !== 'string') {
+          throw new BadRequestException('message.key.remoteJid must be a string');
+        }
       }
 
-      const msg =
-        m?.message && trustMessageContent ? m : ((await this.getMessage(m.key, true)) as proto.IWebMessageInfo);
+      // With key.remoteJid, only that chat's message with this id and fromMe is loaded, never another chat's that
+      // shares the id (#86). Without it, the id-only lookup is kept for backwards compatibility.
+      const msg = m?.message && trustMessageContent ? m : await this.getMessageForKey(m.key);
 
       if (!msg) {
         throw 'Message not found';
@@ -4877,7 +4915,7 @@ export class BaileysStartupService extends ChannelStartupService {
         return data;
       }
 
-      const msg: any = await this.getMessage(data.key, true);
+      const msg: any = await this.getMessageForKey(data.key);
 
       if (msg?.messageType === 'conversation' || msg?.messageType === 'extendedTextMessage') {
         return { text: data.text };
@@ -4909,7 +4947,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     try {
-      const oldMessage: any = await this.getMessage(data.key, true);
+      const oldMessage: any = await this.getMessageForKey(data.key);
       if (this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
         if (!oldMessage) throw new NotFoundException('Message not found');
         if (oldMessage?.key?.remoteJid !== jid) {
@@ -5511,7 +5549,7 @@ export class BaileysStartupService extends ChannelStartupService {
       return 'ignored';
     }
 
-    const target = await this.findMessageInChat(received.key, targetId);
+    const target = await this.getMessageByFullKey({ ...received.key, id: targetId });
     if (!target) {
       return 'not_found';
     }
@@ -5561,27 +5599,6 @@ export class BaileysStartupService extends ChannelStartupService {
     });
 
     return 'edited';
-  }
-
-  /** Finds a stored message by id within one chat (remoteJid or its LID/PN alternate) and the same fromMe. */
-  private async findMessageInChat(chatKey: proto.IMessageKey, id: string): Promise<Message | null> {
-    const chatJids = [chatKey.remoteJid, (chatKey as ExtendedIMessageKey).remoteJidAlt]
-      .filter(Boolean)
-      .map((jid) => jidNormalizedUser(jid));
-    if (chatJids.length === 0) {
-      return null;
-    }
-
-    const rows = (await this.prismaRepository.$queryRaw`
-      SELECT * FROM "Message"
-      WHERE "instanceId" = ${this.instanceId}
-      AND "key"->>'id' = ${id}
-      AND COALESCE(("key"->>'fromMe')::boolean, false) = ${!!chatKey.fromMe}
-      AND ("key"->>'remoteJid' = ANY(${chatJids}::text[]) OR "key"->>'remoteJidAlt' = ANY(${chatJids}::text[]))
-      LIMIT 1
-    `) as Message[];
-
-    return rows[0] ?? null;
   }
 
   private prepareMessage(message: proto.IWebMessageInfo): any {
