@@ -1,3 +1,12 @@
+# Unreleased
+
+### Fixed
+
+* **`POST /chat/getBase64FromMediaMessage` downloads album items again** (closes #91). Photos and videos sent several at a time are stored inside an `associatedChildMessage` wrapper, which the route did not unwrap, so it answered 400 `The message is not of the media type`.
+  * `associatedChildMessage` is now unwrapped like disappearing, view-once and document-with-caption messages.
+  * Nested wrappers are unwrapped in any order, e.g. an album item in a disappearing chat.
+  * A wrapper with no inner message now answers `The message is not of the media type` instead of a `TypeError`.
+
 # 3.3.2 (2026-11-25)
 
 ### Fixed

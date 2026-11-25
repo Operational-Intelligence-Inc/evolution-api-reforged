@@ -60,7 +60,7 @@ import { PrismaRepository, Query } from '@api/repository/repository.service';
 import { chatbotController, waMonitor } from '@api/server.module';
 import { CacheService } from '@api/services/cache.service';
 import { ChannelStartupService } from '@api/services/channel.service';
-import { Events, MessageSubtype, TypeMediaMessage, wa } from '@api/types/wa.types';
+import { Events, TypeMediaMessage, wa } from '@api/types/wa.types';
 import { CacheEngine } from '@cache/cacheengine';
 import { redisClient } from '@cache/rediscache.client';
 import {
@@ -166,6 +166,7 @@ import { BaileysMessageProcessor } from './baileysMessage.processor';
 import { chooseBrowserIdentity, CREDS_IDENTITY_KEY, DESKTOP_IDENTITY } from './browser.identity';
 import { ConnectionHealth, ConnectionHealthReport, LiveState } from './connection-health';
 import { ConnectionWatchdog, WATCHDOG_CHECK_INTERVAL_MS, WatchdogReport } from './connection-watchdog';
+import { unwrapMessageContent } from './media-message';
 import { alternateChatQuery, fullKeyQuery, hasChat, idOnlyQuery } from './message-lookup';
 import { PendingMessageUpdates } from './pending-message-updates';
 import { decideOnClose, nextConflictCount, reconnectDelayMs, STABLE_CONNECTION_MS } from './reconnect.policy';
@@ -4639,11 +4640,7 @@ export class BaileysStartupService extends ChannelStartupService {
         throw 'Message not found';
       }
 
-      for (const subtype of MessageSubtype) {
-        if (msg.message[subtype]) {
-          msg.message = msg.message[subtype].message;
-        }
-      }
+      msg.message = unwrapMessageContent(msg.message);
 
       if ('messageContextInfo' in msg.message && Object.keys(msg.message).length === 1) {
         this.logger.verbose('Message contains only messageContextInfo, skipping media processing');
