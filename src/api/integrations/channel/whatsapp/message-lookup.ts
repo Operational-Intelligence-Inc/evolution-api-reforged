@@ -1,4 +1,6 @@
-import { Prisma } from '@prisma/client';
+// From the Prisma runtime rather than the generated client (Prisma.sql is the same function), so this module and
+// its unit tests load before `prisma generate` has run.
+import { Sql, sqltag } from '@prisma/client/runtime/library';
 import type { proto } from 'baileys';
 
 /**
@@ -52,8 +54,8 @@ export function hasChat(key: MessageKeyLike): boolean {
  * "Message_instanceId_key_unique" ("instanceId", key->>'remoteJid', key->>'id', (key->>'fromMe')::boolean),
  * so it is an index lookup. Keep the expressions as they are or the index stops applying.
  */
-export function fullKeyQuery(instanceId: string, key: MessageKeyLike): Prisma.Sql {
-  return Prisma.sql`
+export function fullKeyQuery(instanceId: string, key: MessageKeyLike): Sql {
+  return sqltag`
     SELECT * FROM "Message"
     WHERE "instanceId" = ${instanceId}
     AND "key"->>'remoteJid' = ANY(${chatJidsOf(key)}::text[])
@@ -69,9 +71,9 @@ export function fullKeyQuery(instanceId: string, key: MessageKeyLike): Prisma.Sq
  * reported by its phone number), or the row may lack fromMe. Still limited to the same chat and direction.
  * Not served by the unique index, so it runs only after fullKeyQuery found nothing.
  */
-export function alternateChatQuery(instanceId: string, key: MessageKeyLike): Prisma.Sql {
+export function alternateChatQuery(instanceId: string, key: MessageKeyLike): Sql {
   const jids = chatJidsOf(key);
-  return Prisma.sql`
+  return sqltag`
     SELECT * FROM "Message"
     WHERE "instanceId" = ${instanceId}
     AND "key"->>'id' = ${key.id}
@@ -87,8 +89,8 @@ export function alternateChatQuery(instanceId: string, key: MessageKeyLike): Pri
  * for a row stored under the LID). Ordered so that when an id is shared by several chats it returns the same row
  * every time.
  */
-export function idOnlyQuery(instanceId: string, id: string): Prisma.Sql {
-  return Prisma.sql`
+export function idOnlyQuery(instanceId: string, id: string): Sql {
+  return sqltag`
     SELECT * FROM "Message"
     WHERE "instanceId" = ${instanceId}
     AND "key"->>'id' = ${id}
