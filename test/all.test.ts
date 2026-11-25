@@ -5,3 +5,4 @@ import './sent.status.test';
 import './connection-health.test';
 import './connection-watchdog.test';
 import './event-queue.test';
+import './message-lookup.test';
