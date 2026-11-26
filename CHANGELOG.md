@@ -1,3 +1,15 @@
+# Unreleased
+
+### Fixed
+
+* **Contacts get their WhatsApp push names** (closes #95). A `"Contact"` row kept the first name written to it, often the bare digits of its JID, so group members who aren't saved contacts (most `@lid` rows) never showed a name.
+  * Live `contacts.update` events now store the push name (`notify`) WhatsApp sends with every received message. Before, it was ignored.
+  * History-sync push names now rename rows that already exist. Before, `createMany({ skipDuplicates })` left them as they were.
+  * One rule for both paths: an address-book name (`name`) replaces any name; a push name (`notify`) or business name (`verifiedName`) replaces only a placeholder (no name, or digits only). The digits fallback is written only when a row is created.
+  * A push name the sender changes later does not replace their earlier one, since `"Contact"` does not record where its name came from.
+  * Names have NUL characters removed and are cut to 100 characters before they are stored.
+  * Accounts paired before this release get history push names only after a re-pair. Live messages fill in names from now on.
+
 # 3.3.3 (2026-11-25)
 
 ### Fixed

@@ -166,6 +166,7 @@ import { BaileysMessageProcessor } from './baileysMessage.processor';
 import { chooseBrowserIdentity, CREDS_IDENTITY_KEY, DESKTOP_IDENTITY } from './browser.identity';
 import { ConnectionHealth, ConnectionHealthReport, LiveState } from './connection-health';
 import { ConnectionWatchdog, WATCHDOG_CHECK_INTERVAL_MS, WatchdogReport } from './connection-watchdog';
+import { bestNamesByJid, fallbackContactName, PickedContactName, shouldReplaceContactName } from './contact-names';
 import { unwrapMessageContent } from './media-message';
 import { alternateChatQuery, fullKeyQuery, hasChat, idOnlyQuery } from './message-lookup';
 import { PendingMessageUpdates } from './pending-message-updates';
@@ -1470,9 +1471,13 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly contactHandle = {
     'contacts.upsert': async (contacts: Contact[]) => {
       try {
+        // Name precedence and when a name may replace a stored one: see contact-names.ts.
+        const names = bestNamesByJid(contacts);
+        const nameOf = (jid: string) => names.get(jid)?.name ?? fallbackContactName(jid);
+
         const contactsRaw: any = contacts.map((contact) => ({
           remoteJid: contact.id,
-          pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
+          pushName: nameOf(contact.id),
           profilePicUrl: null,
           instanceId: this.instanceId,
         }));
@@ -1480,8 +1485,11 @@ export class BaileysStartupService extends ChannelStartupService {
         if (contactsRaw.length > 0) {
           this.sendDataWebhook(Events.CONTACTS_UPSERT, contactsRaw);
 
-          if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
+          if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
             await this.prismaRepository.contact.createMany({ data: contactsRaw, skipDuplicates: true });
+            // createMany leaves existing rows as they are; a real name that arrives later still has to reach them.
+            await this.applyContactNames(names);
+          }
 
           const usersContacts = contactsRaw.filter((c) => c.remoteJid.includes('@s.whatsapp'));
           if (usersContacts) {
@@ -1508,7 +1516,7 @@ export class BaileysStartupService extends ChannelStartupService {
         const updatedContacts = await Promise.all(
           contacts.map(async (contact) => ({
             remoteJid: contact.id,
-            pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
+            pushName: nameOf(contact.id),
             profilePicUrl: (await this.profilePicture(contact.id)).profilePictureUrl,
             instanceId: this.instanceId,
           })),
@@ -1556,12 +1564,15 @@ export class BaileysStartupService extends ChannelStartupService {
     },
 
     'contacts.update': async (contacts: Partial<Contact>[]) => {
+      // Baileys sends the sender's push name as `notify` with every received message (keyed by their LID in a LID
+      // group); name precedence and when a name may replace a stored one: see contact-names.ts.
+      const names = bestNamesByJid(contacts);
       const contactsRaw: { remoteJid: string; pushName?: string; profilePicUrl?: string; instanceId: string }[] = [];
       for await (const contact of contacts) {
         this.logger.debug(`Updating contact: ${JSON.stringify(contact, null, 2)}`);
         contactsRaw.push({
           remoteJid: contact.id,
-          pushName: contact?.name ?? contact?.verifiedName,
+          pushName: names.get(contact.id)?.name,
           profilePicUrl: (await this.profilePicture(contact.id)).profilePictureUrl,
           instanceId: this.instanceId,
         });
@@ -1570,13 +1581,23 @@ export class BaileysStartupService extends ChannelStartupService {
       this.sendDataWebhook(Events.CONTACTS_UPDATE, contactsRaw);
 
       if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
-        const updateTransactions = contactsRaw.map((contact) =>
-          this.prismaRepository.contact.upsert({
+        const existing = await this.prismaRepository.contact.findMany({
+          where: { instanceId: this.instanceId, remoteJid: { in: [...new Set(contactsRaw.map((c) => c.remoteJid))] } },
+          select: { remoteJid: true, pushName: true },
+        });
+        const storedNames = new Map(existing.map((row) => [row.remoteJid, row.pushName]));
+
+        const updateTransactions = contactsRaw.map((contact) => {
+          const picked = names.get(contact.remoteJid);
+          const rename =
+            storedNames.has(contact.remoteJid) &&
+            shouldReplaceContactName(storedNames.get(contact.remoteJid), picked, contact.remoteJid);
+          return this.prismaRepository.contact.upsert({
             where: { remoteJid_instanceId: { remoteJid: contact.remoteJid, instanceId: contact.instanceId } },
-            create: contact,
-            update: contact,
-          }),
-        );
+            create: { ...contact, pushName: picked?.name ?? fallbackContactName(contact.remoteJid) },
+            update: { profilePicUrl: contact.profilePicUrl, ...(rename ? { pushName: picked.name } : {}) },
+          });
+        });
         await this.prismaRepository.$transaction(updateTransactions);
       }
 
@@ -1788,8 +1809,11 @@ export class BaileysStartupService extends ChannelStartupService {
 
         // Every part carries the batch's contacts, to name senders; they are stored once.
         if (firstPart) {
+          // `notify` stays apart from `name`: a push name must not count as an address-book name (contact-names.ts).
           await this.contactHandle['contacts.upsert'](
-            contacts.filter((c) => !!c.notify || !!c.name).map((c) => ({ id: c.id, name: c.name ?? c.notify })),
+            contacts
+              .filter((c) => !!c.notify || !!c.name || !!c.verifiedName)
+              .map((c) => ({ id: c.id, name: c.name, notify: c.notify, verifiedName: c.verifiedName })),
           );
         }
 
@@ -2779,6 +2803,33 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     ctx.step = undefined;
+  }
+
+  /**
+   * Writes real names onto "Contact" rows that already exist, by the rule in contact-names.ts: an address-book name
+   * replaces any name, a push name or business name only a placeholder (no name, or the JID's digits). Each update is
+   * conditional on the name read just before, so a name written meanwhile by another event is not overwritten.
+   */
+  private async applyContactNames(names: Map<string, PickedContactName>) {
+    const jids = [...names.keys()];
+    const CHUNK = 500;
+    for (let i = 0; i < jids.length; i += CHUNK) {
+      const existing = await this.prismaRepository.contact.findMany({
+        where: { instanceId: this.instanceId, remoteJid: { in: jids.slice(i, i + CHUNK) } },
+        select: { remoteJid: true, pushName: true },
+      });
+      const updates = existing
+        .filter((row) => shouldReplaceContactName(row.pushName, names.get(row.remoteJid), row.remoteJid))
+        .map((row) =>
+          this.prismaRepository.contact.updateMany({
+            where: { instanceId: this.instanceId, remoteJid: row.remoteJid, pushName: row.pushName },
+            data: { pushName: names.get(row.remoteJid).name },
+          }),
+        );
+      if (updates.length > 0) {
+        await this.prismaRepository.$transaction(updates);
+      }
+    }
   }
 
   /**

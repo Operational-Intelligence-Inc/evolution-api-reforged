@@ -7,3 +7,4 @@ import './connection-watchdog.test';
 import './event-queue.test';
 import './message-lookup.test';
 import './media-message.test';
+import './contact-names.test';
